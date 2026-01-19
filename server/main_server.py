@@ -56,7 +56,7 @@ def ready():
         return "ready", 200
     return "not_ready", 503
 
-def initialize_topology(device_file="devices.txt", num_clients=10):
+def initialize_topology(device_file="devices.txt", num_clients=3):
     print("⏳ Waiting for clients to register...")
     while len(device_registry) < num_clients:
         print(f"🕒 Registered devices: {len(device_registry)} / {num_clients}")
@@ -208,7 +208,9 @@ def run_federated_training():
     surrogate_log = []
 
     # ---------------- Initialize models ----------------
-    base_model = models.resnet18(weights=None)
+    #base_model = models.resnet18(weights=None)
+
+    base_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     base_model.fc = torch.nn.Linear(base_model.fc.in_features, 10)
 #    base_model = init_resnet(train_last_n_blocks=2)  # train layer3 + layer4 + fc
 
@@ -227,15 +229,32 @@ def run_federated_training():
         num_corr_failed = sum(1 for _, failed_neighbors in correlated_failures if failed_neighbors)
         corr_failure_log.append((current_round, num_corr_failed))
         print(f"🌩️ Correlated failure count: {num_corr_failed}")
-        selected, var_u, total_bias_bound = shared_state.topology.select_fair_nodes(base_model, current_round, correlated_faiures, label_map, num_clients=5, corr_threshold=0.35, lambda_=0.5, epsilon=1e-5)
-        accuracy = shared_state.topology.evaluate_global_model(base_model, selected, subset_size=100)
-        accuracy_log.append((current_round, accuracy))
-        var_u_log.append((current_round, var_u))
-        surrogate_log.append((current_round, total_bias_bound))
+        selected, var_u, total_bias_bound = shared_state.topology.select_fair_nodes(
+            base_model,
+            current_round,
+            correlated_failures,
+            num_clients=5,
+            corr_threshold=0.35,
+            label_map=label_map,
+            lambda_=0.5,
+            epsilon=1e-5,
+        )
+        weights_fair = shared_state.topology.run_federated_round(selected, current_weights_awpsp, base_model)
+        if weights_fair is not None:
+           base_model.load_state_dict(weights_fair)
+           current_weights_awpsp = weights_fair
+           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=False)
+           accuracy_log.append((current_round, accuracy))
+           var_u_log.append((current_round, var_u))
+           surrogate_log.append((current_round, total_bias_bound))
+           print(f"🔁 Round {current_round + 1}: Fair-Select Acc = {accuracy:.2f}%")
+        else:
+           print("⚠️ No updates received from clients. Skipping model update this round.")
 
         # ---------------- AW-PSP branch ----------------
         # Node selection based on AW-PSP
-        awpsp_model = models.resnet18(weights=None)
+#        awpsp_model = models.resnet18(weights=None)
+        awpsp_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         awpsp_model.fc = torch.nn.Linear(awpsp_model.fc.in_features, 10)
         awpsp_model.load_state_dict(current_weights_awpsp)
 
@@ -250,7 +269,7 @@ def run_federated_training():
         if weights_awpsp is not None:
            current_weights_awpsp = weights_awpsp
            awpsp_model.load_state_dict(current_weights_awpsp)
-           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, selected_awpsp, subset_size=100)
+           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, use_selected_nodes=False)
            awpsp_accuracy_log.append((current_round, accuracy_awpsp))
            awpsp_instant_fairness_log.append((current_round, awpsp_instant_var))
            awpsp_cumul_fairness_log.append((current_round, awpsp_cumul_var))
@@ -266,7 +285,8 @@ def run_federated_training():
 
         # ---------------- PSP branch ----------------
         # Use a fresh model copy so AW-PSP doesn’t pollute PSP results
-        psp_model = models.resnet18(weights=None)
+        #psp_model = models.resnet18(weights=None)
+        psp_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         psp_model.fc = torch.nn.Linear(psp_model.fc.in_features, 10)
         psp_model.load_state_dict(current_weights_psp)
 
@@ -281,7 +301,7 @@ def run_federated_training():
         if weights_psp is not None:
            current_weights_psp = weights_psp
            psp_model.load_state_dict(current_weights_psp)
-           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, selected_psp, subset_size=100)
+           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, use_selected_nodes=False)
            psp_accuracy_log.append((current_round, accuracy_psp))
            psp_instant_fairness_log.append((current_round, psp_instant_var))
            psp_cumul_fairness_log.append((current_round, psp_cumul_var))
@@ -315,7 +335,7 @@ def run_federated_training():
         ])
 
 
-def wait_for_latency_data(num_clients=10):
+def wait_for_latency_data(num_clients=3):
     print("⏳ Waiting for latency updates from clients...")
     while True:
         ready = 0

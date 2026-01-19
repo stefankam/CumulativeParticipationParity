@@ -52,6 +52,8 @@ class TopologyProvider:
         self.node_losses = {}
         self.total_rounds_elapsed = 0
         self.availability_counts = defaultdict(int)
+        self.psp_availability_counts = defaultdict(int)
+        self.awpsp_availability_counts = defaultdict(int)
         self.last_model_states = {}  # node_id → (model_state_dict, round_number)
         self.surrogate_contributions = defaultdict(int)
         self.surrogate_staleness = defaultdict(int)
@@ -62,7 +64,7 @@ class TopologyProvider:
         self.recovery_threshold = 4   # rounds to wait before marking as recovered
         self.probation_duration = 3   # rounds to weight updates less
 
-    def get_subset_indices(self, worker_name, dataset, subset_size=100, seed=42):
+    def get_subset_indices(self, worker_name, dataset, subset_size=1000, seed=42):
         """
         Return non-IID training data indices per worker (by label).
         """
@@ -100,7 +102,7 @@ class TopologyProvider:
 
 
 
-    def get_subset_indices1(self, worker_name, total_size, subset_size=100, seed=42):
+    def get_subset_indices1(self, worker_name, total_size, subset_size=1000, seed=42):
         # Make subset selection deterministic per worker
         index = int(worker_name.replace("Device_", ""))
         random.seed(seed + index)
@@ -169,6 +171,7 @@ class TopologyProvider:
     def get_transform(self):
         """Get the transform needed for CIFAR-10."""
         return transforms.Compose([
+            transforms.Resize(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
@@ -181,7 +184,7 @@ class TopologyProvider:
         self.dataloaders = {}
 
         for worker_name in self.devices:
-            indices = self.get_subset_indices(worker_name, full_dataset, subset_size=100)
+            indices = self.get_subset_indices(worker_name, full_dataset, subset_size=1000)
             filtered_dataset = torch.utils.data.Subset(full_dataset, indices)
 
             # Store dataloader per worker
@@ -199,7 +202,8 @@ class TopologyProvider:
         return self.dataloaders  # Optionally return if you want
 
 
-    def send_weights_to_client(self, device_id, global_weights, max_retries=50, sync_only=False):
+
+    def send_weights_to_client(self, device_id, global_weights, max_retries=50):
         # Get IP and port of the device
         entry = self.device_registry[device_id]
         ip = entry["ip"]
@@ -218,11 +222,7 @@ class TopologyProvider:
                buffer.seek(0)
                files = {"weights": ("model.pth", buffer)}
 
-               # Send sync_only flag so client can decide whether to train
-               data = {"sync_only": sync_only}
-
-
-               response = requests.post(url, files=files, data=data, timeout=50)
+               response = requests.post(url, files=files, timeout=5000)
 
                if response.status_code == 200:
                   return torch.load(io.BytesIO(response.content), map_location="cpu")
@@ -242,100 +242,48 @@ class TopologyProvider:
         return pod_dns
 
 
-    def run_federated_round(self, selected_hosts, global_weights, model=None, per_client_timeout=30):
+    def run_federated_round(self, selected_hosts, global_weights, model=None):
         updated_weights = []
-        round_failed_nodes = []  # track only this round's failures
-
+        print("selected_hosts: ", selected_hosts)
         for worker_name in selected_hosts:
-           # Check probation state
-           if worker_name in self.probation_rounds:
-              # First probation round: sync only
-              if self.probation_rounds[worker_name] == 0:
-                 print(f"   ^p^n Syncing global weights to recovered node {worker_name}")
-                 self.send_weights_to_client(worker_name, global_weights, sync_only=True)
-                 self.probation_rounds[worker_name] += 1
-                 continue
-              # Later probation rounds: will train, but with reduced weight
-
-           # 2. Normal training flow
-           print("Sending weights to:", worker_name)
-           start_time = time.time()
-           client_weights = None
-           while time.time() - start_time < per_client_timeout:
-               client_weights = self.send_weights_to_client(worker_name, global_weights, sync_only=False)
-               if client_weights is not None:
-                  break
-               time.sleep(0.5)
-
-           if client_weights is not None:
-               # Reduce weight if node is still in probation
-               weight_factor = 1.0
-               if worker_name in self.probation_rounds:
-                  # Get current probation round index
-                  current_prob_round = self.probation_rounds[worker_name]
-        
-                  # Scale weight proportionally from 0.25 → 1.0
-                  weight_factor = 0.25 + 0.75 * (current_prob_round / self.probation_duration)
-
-                  # Increment probation round
-                  self.probation_rounds[worker_name] += 1
-
-                  # End probation if duration reached
-                  if self.probation_rounds[worker_name] >= self.probation_duration:
-                     del self.probation_rounds[worker_name]
-
-               updated_weights.append((client_weights, weight_factor))
-           else:
-               print(f"   ^z^o Client {worker_name} did not respond within {per_client_timeout}s, marking as failed.")
-               round_failed_nodes.append(worker_name)
-
-        # Merge timeout failures with existing failed list (don't overwrite)
-        for node in round_failed_nodes:
-           if node not in self.failed_nodes:
-               self.failed_nodes.append(node)
-
+            print("Sending weights to:", worker_name)
+            client_weights = self.send_weights_to_client(worker_name, global_weights)
+            updated_weights.append(client_weights)
         return self.aggregate_weights(updated_weights)
 
 
-
-    def aggregate_weights(self, weighted_list):
-        # Filter out None entries
-        weighted_list = [w for w in weighted_list if w is not None]
-        if not weighted_list:
-           print("   ^z         ^o No weights to aggregate (no clients participated this round).")
+    def aggregate_weights(self, weight_list):
+        if not weight_list:
+           print("⚠️ No weights to aggregate (no clients participated this round).")
            return None  # or return last global weights, or reinitialize
-        # weighted_list is [(state_dict, weight_factor), ...]
-        new_state = copy.deepcopy(weighted_list[0][0])
+        new_state = copy.deepcopy(weight_list[0])
         for key in new_state:
-           if torch.is_floating_point(new_state[key]):
-              total = 0.0
-              total_weight = 0.0
-              for w, factor in weighted_list:
-                 total += w[key] * factor
-                 total_weight += factor
-              new_state[key] = total / total_weight if total_weight > 0 else total
-           else:
-              new_state[key] = weighted_list[0][0][key]
+            if torch.is_floating_point(new_state[key]):
+               new_state[key] = sum(w[key] for w in weight_list) / len(weight_list)
+            else:
+               # Non-float types (e.g. LongTensor): just copy the first one
+               new_state[key] = weight_list[0][key]
         return new_state  
 
 
-    def evaluate_global_model(self, model, selected_nodes, subset_size=100):
+    def evaluate_global_model(self, model, selected_nodes=None, subset_size=1000, use_selected_nodes=True):
         correct = total = 0
         model.eval()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
 
-        full_dataset = datasets.CIFAR10(root='data/', train=True, download=False, transform=self.transform)
+        if use_selected_nodes and selected_nodes:
+            full_dataset = datasets.CIFAR10(root='data/', train=True, download=False, transform=self.transform)
 
+            # Combine subsets from selected nodes
+            combined_datasets = []
+            for node in selected_nodes:
+                subset = torch.utils.data.Subset(full_dataset, self.fixed_indices[node])
+                combined_datasets.append(subset)
+            eval_dataset = ConcatDataset(combined_datasets)
+        else:
+            eval_dataset = datasets.CIFAR10(root='data/', train=False, download=False, transform=self.transform)
 
-        # Combine subsets from selected nodes
-        combined_datasets = []
-        for node in selected_nodes:
-#            indices = self.get_subset_indices(node, full_dataset, subset_size)
-            subset = torch.utils.data.Subset(full_dataset, self.fixed_indices[node])
-            combined_datasets.append(subset)
-
-        eval_dataset = ConcatDataset(combined_datasets)
         test_loader = DataLoader(eval_dataset, batch_size=32, shuffle=False)
 
         with torch.no_grad():
@@ -345,6 +293,7 @@ class TopologyProvider:
                correct += (predicted == labels).sum().item()
                total += labels.size(0)
         accuracy = 100 * correct / total
+
         return accuracy
 
 
@@ -371,7 +320,7 @@ class TopologyProvider:
 
 
 
-    def get_correlated_failure(self, current_round, availability_vectors, corr_threshold=0.4, num_neighbors=4):
+    def get_correlated_failure(self, current_round, availability_vectors, corr_threshold=0.6, num_neighbors=4):
         print("corr_threshold: ", corr_threshold)
    
         # 1. Compute trace-based correlation matrix
@@ -393,6 +342,7 @@ class TopologyProvider:
                     for other_node, other_latency in node_latencies.items()
                     if other_node != node]
             print(f"node {node} has latency: ", latency)
+            print("filtered: ", filtered)
             sorted_neighbors = sorted(filtered, key=lambda x: abs(x[1] - latency))
             self.node_neighbors[node] = [n for n, _ in sorted_neighbors[:num_neighbors]]
  
@@ -424,7 +374,7 @@ class TopologyProvider:
                      self.failed_nodes.remove(node)
 
                      # put node into probation phase
-                     self.probation_rounds[node] = 0
+#                     self.probation_rounds[node] = 0
 
         # 5. Use trace correlation and failure correlation to detect groups
         correlated_failures = []
@@ -434,6 +384,7 @@ class TopologyProvider:
 #                if neighbor in self.failed_nodes:
                    normalized_node = node.lower().replace("device_", "h")
                    normalized_neighbor = neighbor.lower().replace("device_", "h")
+                   print(f"device_idx[{normalized_node}]: ", device_idx[normalized_node])
                    trace_score = matrix[device_idx[normalized_node]][device_idx[normalized_neighbor]] if normalized_node in device_idx and normalized_neighbor in device_idx else 0                   
                    fail_score = len(self.failure_correlation[node][neighbor]) / (current_round + 1) if neighbor in self.failure_correlation[node] else 0
                    print(f"for node {node} and neighbor {neighbor}, trace_score is {trace_score} and fail_score is {fail_score}")
@@ -445,19 +396,13 @@ class TopologyProvider:
         else:
            print("✅ No correlated failures detected.")
 
-        # Estimate availability_count
-        available_nodes = [node for node in self.dht.table if node not in self.failed_nodes]
-        for node in available_nodes:
-            self.availability_counts[node] += 1
-
 
         return correlated_failures
 
 
-
-    def select_fair_nodes(self, model, current_round, correlated_faiures, num_clients, corr_threshold, label_map, lambda_=0.5, epsilon=1e-5):
+    def select_fair_nodes(self, model, current_round, correlated_failures,  label_map, num_clients,  corr_threshold=0.35, lambda_=0.5, epsilon=1e-5):        
         """
-        Select a subset of active nodes with:
+        - Select a subset of active nodes with:
         - Inverse availability × reactive reweighting (fairness-aware)
         - Class (label) coverage
         """
@@ -465,13 +410,26 @@ class TopologyProvider:
         lambda_ = 0.5       # decay rate (can be tuned or swept)
 
         # 1. Get active nodes
-        active_hosts = [node for node, metadata in self.dht.table.items() if node not in self.failed_nodes and node not in correlated_failures]
+        correlated_nodes = {n for pair in correlated_failures for n in pair}
+        active_hosts = [node for node, metadata in self.dht.table.items() if node not in self.failed_nodes and node not in correlated_nodes]
+        all_hosts = [node for node, metadata in self.dht.table.items()]
         print(f"❌ Failed Hosts: {self.failed_nodes}")
         print("✅ Active Hosts:", active_hosts)
 
         # Save the latest model state after training
         for host in active_hosts:
-            self.last_model_states[host.name] = (copy.deepcopy(model.state_dict()), current_round)
+            self.last_model_states[host] = (copy.deepcopy(model.state_dict()), current_round)
+
+        #Load custom test subsets per node
+        full_test_dataset = datasets.CIFAR10(
+            root='data/', train=True, download=False, transform=self.transform)
+
+        node_test_loaders = {}
+
+        for node in all_hosts:
+            subset = torch.utils.data.Subset(full_test_dataset, self.fixed_indices[node])
+            node_test_loaders[node] = torch.utils.data.DataLoader(subset, batch_size=32, shuffle=False)
+
 
         all_clients = list(self.dht.table.keys())
         missing_clients = [n for n in all_clients if n not in active_hosts]
@@ -489,9 +447,12 @@ class TopologyProvider:
                surrogate_model.eval()
 
                # Evaluate on current batch for simulation
-               for image, label in self.sample_images:
-                   if label.view(-1)[0].item() not in label_map.get(node, []):
-                      continue
+        #       for image, label in self.sample_images:
+         #          if label.view(-1)[0].item() not in label_map.get(node, []):
+          #            continue
+
+               for image, label in node_test_loaders[node]:
+                   labels = label.long()
 
                    with torch.no_grad():
                       output = surrogate_model(image)
@@ -567,11 +528,241 @@ class TopologyProvider:
             host = self.dht.table[node]
             relevant_losses = []
 
-            for image, label in self.sample_images:
-              # Check if the label is relevant for this node (cast label to int)
-              if label.view(-1)[0].item() not in label_map.get(node, []):
-                 continue
-             
+            for image, label in node_test_loaders[node]:
+ 
+              # Ensure label is LongTensor for CrossEntropyLoss
+              label = label.long()
+
+              # Get prediction and compute loss
+              with torch.no_grad():
+                 output = model(image)
+                 loss = loss_fn(output, label).item()
+                 relevant_losses.append(loss)
+ 
+            if relevant_losses:
+              avg_loss = sum(relevant_losses) / len(relevant_losses)
+
+              # Compute utility as positive delta from previous loss
+              prev = self.previous_losses.get(node, None)
+              if prev is not None:
+                 delta_f = max(0, prev - avg_loss)
+                 self.utility_log[node] += delta_f
+
+              # Save loss for next round
+              self.previous_losses[node] = avg_loss
+
+
+        # 7. Compute and report fairness variance
+        normalized_utilities = []
+        for node in self.utility_log:
+            if self.total_rounds_elapsed > 0:
+               pi_k = self.availability_counts[node] / self.total_rounds_elapsed
+               u_k = self.utility_log[node]
+               print(f"for node {node}, pi_k = {pi_k} and u_k = {u_k}") 
+               if pi_k > 0:
+                  avg_u_k = u_k / self.total_rounds_elapsed
+                  u_tilde_k = avg_u_k / pi_k
+                  normalized_utilities.append(u_tilde_k)
+        var_u = 0.0
+        if normalized_utilities:
+            mean_u = sum(normalized_utilities) / len(normalized_utilities)
+            var_u = sum((u - mean_u) ** 2 for u in normalized_utilities) / len(normalized_utilities)
+            print(f"🎯 Fairness Variance (Normalized Utility): {var_u:.4f}")
+
+        else:
+            var_u = 0
+
+
+        return selected, var_u, total_bias_bound 
+
+
+
+    def psp_random_selection(self, model, correlated_failures, num_clients, label_map):
+        """
+        Classical PSP: Randomly sample a subset of available nodes.
+        """
+        available_nodes = [node for node in self.dht.table if node not in self.failed_nodes]
+        selected = random.sample(available_nodes, min(num_clients, len(available_nodes)))
+
+        # 4. Covered_labels
+        covered_labels = set()
+    
+        for node in selected:
+            node_labels = set(label_map.get(node, []))
+            covered_labels.update(node_labels)
+
+        # 6. Load custom test subsets per node
+        full_test_dataset = datasets.CIFAR10(
+            root='data/', train=True, download=False, transform=self.transform)
+
+        node_test_loaders = {}
+
+        for node in selected:
+            self.psp_availability_counts[node] += 1
+            subset = torch.utils.data.Subset(full_test_dataset, self.fixed_indices[node])
+            node_test_loaders[node] = torch.utils.data.DataLoader(subset, batch_size=32, shuffle=False)
+
+
+        # 7. Evaluate    ^tF_k(t) and Calculate Fairness Variance
+        loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+
+        # Store per-round losses
+        current_round_losses = {}
+        class_losses = defaultdict(list)
+
+        for node in selected:
+           relevant_losses = []
+
+           for image, label in node_test_loaders[node]:
+               labels = label.long()
+
+               with torch.no_grad():
+                    output = model(image)
+                    losses = loss_fn(output, labels)       
+
+               # iterate per sample to assign loss to correct class
+               for  lbl, loss in zip(labels, losses):
+                    class_losses[int(lbl.item())].append(loss.item())
+                    relevant_losses.append(loss.item())
+
+
+           if relevant_losses:
+               avg_loss = sum(relevant_losses) / len(relevant_losses)
+               current_round_losses[node] = avg_loss
+               print(f"   ^=^s^i Node {node} - Avg loss this round: {avg_loss:.4f}")
+
+           # Append to historical record for cumulative fairness
+           self.node_losses.setdefault(node, []).append(avg_loss)
+
+
+        # Pseudo-code for per-class variance
+        per_class_variance = {c: np.var(losses) for c, losses in class_losses.items()}
+        #weights = {c: 1 / label_counts[c] for c in per_class_variance}  # rarer labels weigh more
+        #fairness_variance = np.average(list(per_class_variance.values()), weights=list(weights.values()))
+        within_class_variance = np.mean(list(per_class_variance.values()))
+
+        # after populating `class_losses` where keys are ints (class labels) and values are lists of per-sample losses
+
+        import math
+
+        # minimum samples per class to include it in the inter-class fairness metric
+        MIN_SAMPLES_PER_CLASS = 2
+
+        # 1) per-class statistics
+        per_class_means = {}
+        per_class_vars  = {}
+        per_class_counts = {}
+
+        for c, losses in class_losses.items():
+               cnt = len(losses)
+               per_class_counts[c] = cnt 
+               if cnt == 0:
+                  continue
+               # use population mean; for within-class variance you may use ddof=1 if cnt>1
+               per_class_means[c] = float(np.mean(losses))
+               if cnt > 1:
+                  per_class_vars[c] = float(np.var(losses, ddof=1))  # sample variance 
+               else:
+                  per_class_vars[c] = 0.0
+
+        # 2) Inter-class fairness: variance of class means (this is the recommended fairness metric)
+        valid_class_means = [m for c, m in per_class_means.items() if per_class_counts.get(c,0) >= MIN_SAMPLES_PER_CLASS]
+
+        if len(valid_class_means) >= 1:
+              # variance across class means (population variance)
+              fairness_inter_class = float(np.var(valid_class_means, ddof=0))
+              # optional: normalized (coefficient of variation) to compare across rounds with different loss scale
+              mean_of_means = float(np.mean(valid_class_means)) 
+              fairness_inter_class_rel = fairness_inter_class / (mean_of_means**2 + 1e-12)  # relative squared-CV 
+        else:
+              fairness_inter_class = 0.0
+              fairness_inter_class_rel = 0.0
+
+        # 3) (Optional) average within-class variance
+        if per_class_vars:
+              avg_within_class_var = float(np.mean(list(per_class_vars.values())))
+        else:
+              avg_within_class_var = 0.0
+
+        # Logging
+        print(f"[FAIRNESS] inter-class var = {fairness_inter_class:.6f}  (rel {fairness_inter_class_rel:.6f}), "
+              f"avg-within-class-var = {avg_within_class_var:.6f}, classes-used = {len(valid_class_means)}")
+
+
+        # ---- Fairness Metric 1: Instant (Current Round) ----
+        instant_fairness_variance = 0.0
+        if current_round_losses: 
+           mean_loss_round = sum(current_round_losses.values()) / len(current_round_losses)
+           instant_fairness_variance = sum(
+              (loss - mean_loss_round) ** 2 for loss in current_round_losses.values()
+           ) / len(current_round_losses)
+           print(f"🎯 Instant Fairness Variance (this round): {instant_fairness_variance:.4f}")
+
+        # ---- Fairness Metric 2: Cumulative (All Rounds So Far) ----
+        cumulative_fairness_variance = 0.0
+        avg_losses_over_time = {
+           node: sum(losses) / len(losses)
+           for node, losses in self.node_losses.items()
+           if len(losses) > 0
+        } 
+
+        avg_availability_count = {}
+        for node in self.psp_availability_counts:
+            if self.total_rounds_elapsed > 0:
+               avg_availability_count[node] = self.psp_availability_counts[node] / self.total_rounds_elapsed
+               print(f"avg_availability_count[{node}]: {avg_availability_count[node]} for total rounds of {self.total_rounds_elapsed}")
+
+        if avg_losses_over_time and sum(self.psp_availability_counts[node] for node in avg_losses_over_time) > 0:
+           mean_loss_all = sum(avg_losses_over_time.values()) / len(avg_losses_over_time)
+           cumulative_fairness_variance = sum( 
+           self.psp_availability_counts[node] * ((avg_losses_over_time[node] - mean_loss_all) ** 2)
+           for node in avg_losses_over_time
+           ) / sum(self.psp_availability_counts[node] for node in avg_losses_over_time)
+           print(f"Cumulative Fairness Variance (all rounds): {cumulative_fairness_variance:.4f}")
+
+
+        # metrics for demonstration ---
+        # Avg availability x freshness
+        sel_scores = [self.dht.table[node]["availability"] * self.get_freshness(node, self.total_rounds_elapsed) 
+                  for node in selected]
+        avg_sel_score = float(np.mean(sel_scores)) if sel_scores else 0.0
+
+        # Class coverage stats
+        class_counts = np.zeros(10, dtype=np.int64)
+        for node in selected:
+          for lbl in label_map.get(node, []):
+             class_counts[int(lbl)] += 1
+        total = class_counts.sum()
+        if total > 0:
+          p = class_counts / total
+          u = np.full_like(p, 1/len(p), dtype=np.float64)
+          eps = 1e-12
+          kl = float(np.sum(p*(np.log(p+eps)-np.log(u+eps))))
+        else:
+          kl = 0.0
+        unseen_rate = float(np.mean(class_counts==0))
+
+        # Participation Gini
+        all_nodes = list(self.dht.table.keys())
+        counts = np.array([len(self.participation_log.get(n, [])) for n in all_nodes], dtype=np.float64)
+        if counts.sum()>0:
+           diffs = np.abs(counts.reshape(-1,1)-counts.reshape(1,-1))
+           gini = float(diffs.sum() / (2*counts.size*counts.sum()))
+        else:
+           gini = 0.0
+
+        print(f"[RANDOM PSP] avg_score={avg_sel_score:.3f} |labels|={np.sum(class_counts>0)} KL={kl:.4f} unseen={unseen_rate:.2f} Gini={gini:.3f}")
+
+
+
+       # 6. Evaluate    ^tF_k(t) and update u_k
+        loss_fn = torch.nn.CrossEntropyLoss()
+        for node in selected:
+            host = self.dht.table[node]
+            relevant_losses = []
+
+            for image, label in node_test_loaders[node]:
+ 
               # Ensure label is LongTensor for CrossEntropyLoss
               label = label.long()
 
@@ -607,98 +798,14 @@ class TopologyProvider:
         if normalized_utilities:
             mean_u = sum(normalized_utilities) / len(normalized_utilities)
             var_u = sum((u - mean_u) ** 2 for u in normalized_utilities) / len(normalized_utilities)
-            print(f"🎯 Fairness Variance (Normalized Utility): {var_u:.4f}")
+            print(f"   ^=^n    Fairness Variance (Normalized Utility): {var_u:.4f}")
 
-        return list(selected)
+        else:
+            var_u = 0
 
 
-    def psp_random_selection(self, model, correlated_failures, num_clients, label_map):
-        """
-        Classical PSP: Randomly sample a subset of available nodes.
-        """
-        available_nodes = [node for node in self.dht.table if node not in self.failed_nodes]
-        selected = random.sample(available_nodes, min(num_clients, len(available_nodes)))
 
-        # 4. Covered_labels
-        covered_labels = set()
-    
-        for node in selected:
-            node_labels = set(label_map.get(node, []))
-            if not node_labels.issubset(covered_labels):
-               covered_labels.update(node_labels)
-
-        # 6. Load custom test subsets per node
-        full_test_dataset = datasets.CIFAR10(
-            root='data/', train=True, download=False, transform=self.transform)
-
-        node_test_loaders = {}
-        for node in selected:
-            subset = torch.utils.data.Subset(full_test_dataset, self.fixed_indices[node])
-            node_test_loaders[node] = torch.utils.data.DataLoader(subset, batch_size=32, shuffle=False)
-
-            # Optional: build label_map per node
-            label_set = set()
-            for _, label in subset:
-               label_set.add(int(label))
-            label_map[node] = sorted(label_set)
-
-        # 7. Evaluate ΔF_k(t) and Calculate Fairness Variance
-        loss_fn = torch.nn.CrossEntropyLoss()
-
-        # Store per-round losses
-        current_round_losses = {}
-
-        for node in selected:
-           relevant_losses = []
-
-           for image, label in node_test_loaders[node]:
-               label = label.long()
-
-               with torch.no_grad():
-                    output = model(image)
-                    loss = loss_fn(output, label).item()
-                    relevant_losses.append(loss)
-
-           if relevant_losses:
-               avg_loss = sum(relevant_losses) / len(relevant_losses)
-               current_round_losses[node] = avg_loss
-               print(f"📉 Node {node} - Avg loss this round: {avg_loss:.4f}")
-
-           # Append to historical record for cumulative fairness
-           self.node_losses.setdefault(node, []).append(avg_loss)
-
-        # ---- Fairness Metric 1: Instant (Current Round) ----
-        instant_fairness_variance = 0.0
-        if current_round_losses: 
-           mean_loss_round = sum(current_round_losses.values()) / len(current_round_losses)
-           instant_fairness_variance = sum(
-              (loss - mean_loss_round) ** 2 for loss in current_round_losses.values()
-           ) / len(current_round_losses)
-           print(f"🎯 Instant Fairness Variance (this round): {instant_fairness_variance:.4f}")
-
-        # ---- Fairness Metric 2: Cumulative (All Rounds So Far) ----
-        cumulative_fairness_variance = 0.0
-        avg_losses_over_time = {
-           node: sum(losses) / len(losses)
-           for node, losses in self.node_losses.items()
-           if len(losses) > 0
-        } 
-
-        avg_availability_count = {}
-        for node in self.availability_counts:
-            if self.total_rounds_elapsed > 0:
-               avg_availability_count[node] = self.availability_counts[node] / self.total_rounds_elapsed
-               print(f"avg_availability_count[{node}]: {avg_availability_count[node]} for total rounds of {self.total_rounds_elapsed}")
-        if avg_losses_over_time:
-            mean_loss_all = sum(avg_losses_over_time.values()) / len(avg_losses_over_time)
-            cumulative_fairness_variance = sum(
-            ((avg_losses_over_time[node] - mean_loss_all) ** 2) / avg_availability_count[node]
-            for node in avg_losses_over_time
-            ) / len(avg_losses_over_time)
-
-            print(f"Cumulative Fairness Variance (all rounds): {cumulative_fairness_variance:.4f}")
-
-        return selected, instant_fairness_variance, cumulative_fairness_variance, covered_labels
+        return selected, var_u, fairness_inter_class, covered_labels, avg_sel_score, np.sum(class_counts>0), kl, unseen_rate, gini
 
 
     def prioritize_available_nodes(self, model, current_round, correlated_failures, num_clients, label_map):
@@ -731,15 +838,11 @@ class TopologyProvider:
         # 4. Greedily pick nodes that maximize class coverage from top-ranked
         selected = set()
         covered_labels = set()
-    
-        for node, _ in scores:
-            node_labels = set(label_map.get(node, []))
-            if not node_labels.issubset(covered_labels):
-               selected.add(node)
-               covered_labels.update(node_labels)
-               print(f"Selected {node} for new labels {node_labels - covered_labels}")
-            elif len(selected) < num_clients:
-               selected.add(node)
+        sel_scores = []
+        for node, score in scores:
+            selected.add(node)
+            sel_scores.append(score)   # <-- record score for avg
+            covered_labels.update(label_map.get(node, []))
             if len(selected) >= num_clients:
                break  # all classes covered
 
@@ -758,40 +861,99 @@ class TopologyProvider:
             root='data/', train=True, download=False, transform=self.transform)
 
         node_test_loaders = {}
+
         for node in selected:
-            subset = torch.utils.data.Subset(full_test_dataset, self.fixed_indices[node])
+            self.awpsp_availability_counts[node] += 1
+            indices = [i for i in self.fixed_indices[node] if full_test_dataset[i][1] in covered_labels]
+
+            subset = torch.utils.data.Subset(full_test_dataset, indices)
             node_test_loaders[node] = torch.utils.data.DataLoader(subset, batch_size=32, shuffle=False)
 
-            # Optional: build label_map per node
-            label_set = set()
-            for _, label in subset:
-               label_set.add(int(label))
-            label_map[node] = sorted(label_set)
 
-       # 7. Evaluate ΔF_k(t) and Calculate Fairness Variance
-        loss_fn = torch.nn.CrossEntropyLoss()
+        # 7. Evaluate    ^tF_k(t) and Calculate Fairness Variance
+        loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
 
         # Store per-round losses
         current_round_losses = {}
+        class_losses = defaultdict(list)
 
         for node in selected:
            relevant_losses = []
 
            for image, label in node_test_loaders[node]:
-               label = label.long()
+               labels = label.long()
 
                with torch.no_grad():
                     output = model(image)
-                    loss = loss_fn(output, label).item()
-                    relevant_losses.append(loss)
+                    losses = loss_fn(output, labels)       
+
+               # iterate per sample to assign loss to correct class
+               for  lbl, loss in zip(labels, losses):
+                    class_losses[int(lbl.item())].append(loss.item())
+                    relevant_losses.append(loss.item())
+
 
            if relevant_losses:
                avg_loss = sum(relevant_losses) / len(relevant_losses)
                current_round_losses[node] = avg_loss
-               print(f"📉 Node {node} - Avg loss this round: {avg_loss:.4f}")
+               print(f"   ^=^s^i Node {node} - Avg loss this round: {avg_loss:.4f}")
 
            # Append to historical record for cumulative fairness
            self.node_losses.setdefault(node, []).append(avg_loss)
+
+        # Pseudo-code for per-class variance
+        per_class_variance = {c: np.var(losses) for c, losses in class_losses.items()}
+        #weights = {c: 1 / label_counts[c] for c in per_class_variance}  # rarer labels weigh more
+        #fairness_variance = np.average(list(per_class_variance.values()), weights=list(weights.values()))
+        within_class_variance = np.mean(list(per_class_variance.values()))
+
+        # after populating `class_losses` where keys are ints (class labels) and values are lists of per-sample losses
+
+        import math
+
+        # minimum samples per class to include it in the inter-class fairness metric
+        MIN_SAMPLES_PER_CLASS = 2
+
+        # 1) per-class statistics
+        per_class_means = {}
+        per_class_vars  = {}
+        per_class_counts = {}
+
+        for c, losses in class_losses.items():
+               cnt = len(losses)
+               per_class_counts[c] = cnt 
+               if cnt == 0:
+                  continue
+               # use population mean; for within-class variance you may use ddof=1 if cnt>1
+               per_class_means[c] = float(np.mean(losses))
+               if cnt > 1:
+                  per_class_vars[c] = float(np.var(losses, ddof=1))  # sample variance 
+               else:
+                  per_class_vars[c] = 0.0
+
+        # 2) Inter-class fairness: variance of class means (this is the recommended fairness metric)
+        valid_class_means = [m for c, m in per_class_means.items() if per_class_counts.get(c,0) >= MIN_SAMPLES_PER_CLASS]
+
+        if len(valid_class_means) >= 1:
+              # variance across class means (population variance)
+              fairness_inter_class = float(np.var(valid_class_means, ddof=0))
+              # optional: normalized (coefficient of variation) to compare across rounds with different loss scale
+              mean_of_means = float(np.mean(valid_class_means)) 
+              fairness_inter_class_rel = fairness_inter_class / (mean_of_means**2 + 1e-12)  # relative squared-CV 
+        else:
+              fairness_inter_class = 0.0
+              fairness_inter_class_rel = 0.0
+
+        # 3) (Optional) average within-class variance (what you had before)
+        if per_class_vars:
+              avg_within_class_var = float(np.mean(list(per_class_vars.values())))
+        else:
+              avg_within_class_var = 0.0
+
+        # Logging
+        print(f"[FAIRNESS] inter-class var = {fairness_inter_class:.6f}  (rel {fairness_inter_class_rel:.6f}), "
+              f"avg-within-class-var = {avg_within_class_var:.6f}, classes-used = {len(valid_class_means)}")
+
 
         # ---- Fairness Metric 1: Instant (Current Round) ----
         instant_fairness_variance = 0.0
@@ -810,21 +972,103 @@ class TopologyProvider:
            if len(losses) > 0
         } 
 
+
         avg_availability_count = {}
-        for node in self.availability_counts:
+        for node in self.awpsp_availability_counts:
             if self.total_rounds_elapsed > 0:
-               avg_availability_count[node] = self.availability_counts[node] / self.total_rounds_elapsed
+               avg_availability_count[node] = self.awpsp_availability_counts[node] / self.total_rounds_elapsed
+               print(f"availability_counts[{node}] is {self.awpsp_availability_counts[node]}")
 
-        if avg_losses_over_time:
-            mean_loss_all = sum(avg_losses_over_time.values()) / len(avg_losses_over_time)
-            cumulative_fairness_variance = sum(
-            ((avg_losses_over_time[node] - mean_loss_all) ** 2) / avg_availability_count[node]
-            for node in avg_losses_over_time
-            ) / len(avg_losses_over_time)
+        if avg_losses_over_time and sum(self.awpsp_availability_counts[node] for node in avg_losses_over_time) > 0:
+           mean_loss_all = sum(avg_losses_over_time.values()) / len(avg_losses_over_time)
+           cumulative_fairness_variance = sum( 
+           self.awpsp_availability_counts[node] * ((avg_losses_over_time[node] - mean_loss_all) ** 2)
+           for node in avg_losses_over_time
+           ) / sum(self.awpsp_availability_counts[node] for node in avg_losses_over_time)
+           print(f"Cumulative Fairness Variance (all rounds): {cumulative_fairness_variance:.4f}")
 
-            print(f"Cumulative Fairness Variance (all rounds): {cumulative_fairness_variance:.4f}")
 
-        return selected, instant_fairness_variance, cumulative_fairness_variance, covered_labels
+        # metrics for demonstration ---
+        # Avg availability x freshness
+        avg_sel_score = float(np.mean(sel_scores)) if sel_scores else 0.0
+
+        # Class coverage stats
+        class_counts = np.zeros(10, dtype=np.int64)
+        for node in selected:
+          for lbl in label_map.get(node, []):
+             class_counts[int(lbl)] += 1
+        total = class_counts.sum()
+        if total > 0:
+          p = class_counts / total
+          u = np.full_like(p, 1/len(p), dtype=np.float64)
+          eps = 1e-12
+          kl = float(np.sum(p*(np.log(p+eps)-np.log(u+eps))))
+        else:
+          kl = 0.0
+        unseen_rate = float(np.mean(class_counts==0))
+
+        # Participation Gini
+        all_nodes = list(self.dht.table.keys())
+        counts = np.array([len(self.participation_log.get(n, [])) for n in all_nodes], dtype=np.float64)
+        if counts.sum()>0:
+           diffs = np.abs(counts.reshape(-1,1)-counts.reshape(1,-1))
+           gini = float(diffs.sum() / (2*counts.size*counts.sum()))
+        else:
+           gini = 0.0
+
+        print(f"[PRIORITIZED PSP] avg_score={avg_sel_score:.3f} |labels|={np.sum(class_counts>0)} KL={kl:.4f} unseen={unseen_rate:.2f} Gini={gini:.3f}")
+
+
+       # 6. Evaluate    ^tF_k(t) and update u_k
+        loss_fn = torch.nn.CrossEntropyLoss()
+        for node in selected:
+            host = self.dht.table[node]
+            relevant_losses = []
+
+            for image, label in node_test_loaders[node]:
+ 
+              # Ensure label is LongTensor for CrossEntropyLoss
+              label = label.long()
+
+              # Get prediction and compute loss
+              with torch.no_grad():
+                 output = model(image)
+                 loss = loss_fn(output, label).item()
+                 relevant_losses.append(loss)
+ 
+            if relevant_losses:
+              avg_loss = sum(relevant_losses) / len(relevant_losses)
+
+              # Compute utility as positive delta from previous loss
+              prev = self.previous_losses.get(node, None)
+              if prev is not None:
+                 delta_f = max(0, prev - avg_loss)
+                 self.utility_log[node] += delta_f
+
+              # Save loss for next round
+              self.previous_losses[node] = avg_loss
+
+
+        # 7. Compute and report fairness variance
+        normalized_utilities = []
+        for node in self.utility_log:
+            if self.total_rounds_elapsed > 0:
+               pi_k = self.availability_counts[node] / self.total_rounds_elapsed
+               u_k = self.utility_log[node]
+               print(f"for node {node}, pi_k = {pi_k} and u_k = {u_k}") 
+               u_tilde_k = u_k / pi_k
+               normalized_utilities.append(u_tilde_k)
+
+        if normalized_utilities:
+            mean_u = sum(normalized_utilities) / len(normalized_utilities)
+            var_u = sum((u - mean_u) ** 2 for u in normalized_utilities) / len(normalized_utilities)
+            print(f"   ^=^n    Fairness Variance (Normalized Utility): {var_u:.4f}")
+
+        else:
+            var_u = 0
+
+
+        return selected, var_u, fairness_inter_class, covered_labels, avg_sel_score, np.sum(class_counts>0), kl, unseen_rate, gini
 
 
 # Distributed Hash Table

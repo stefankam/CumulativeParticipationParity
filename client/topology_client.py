@@ -87,7 +87,7 @@ class TopologyProvider:
         self.criterion = torch.nn.CrossEntropyLoss()
         self.optimizer = optim.Adam(self.model.fc.parameters(), lr=0.001)
 
-    def get_subset_indices(self, worker_name, dataset, subset_size=100, seed=42):
+    def get_subset_indices(self, worker_name, dataset, subset_size=1000, seed=42):
         """
         Return non-IID training data indices per worker (by label).
         """
@@ -123,7 +123,7 @@ class TopologyProvider:
         return label_indices[:subset_size]
 
 
-    def get_subset_indices1(self, worker_name, total_size, subset_size=100, seed=42):
+    def get_subset_indices1(self, worker_name, total_size, subset_size=1000, seed=42):
         # Make subset selection deterministic per worker
         index = int(worker_name.replace("h", ""))
         random.seed(seed + index)
@@ -192,11 +192,13 @@ class TopologyProvider:
     def get_transform(self):
         """Get the transform needed for CIFAR-10."""
         return transforms.Compose([
+            transforms.Resize(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2430, 0.2610])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]) 
     
-    def load_cifar_data(self, subset_size=100):
+    def load_cifar_data(self, subset_size=1000):
         """Load the CIFAR-10 dataset."""
         full_dataset = datasets.CIFAR10(root='data/', train=True, download=True, transform=self.transform)
 
