@@ -171,9 +171,8 @@ class TopologyProvider:
     def get_transform(self):
         """Get the transform needed for CIFAR-10."""
         return transforms.Compose([
-            transforms.Resize(224),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2430, 0.2610])
         ])
     
     def load_cifar_data(self):

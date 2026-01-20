@@ -85,7 +85,13 @@ class TopologyProvider:
         self.model = models.resnet18(weights=None)
         self.model.fc = torch.nn.Linear(self.model.fc.in_features, 10)  # CIFAR-10
         self.criterion = torch.nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.model.fc.parameters(), lr=0.001)
+#        self.optimizer = optim.Adam(self.model.fc.parameters(), lr=0.001)
+        for name, param in self.model.named_parameters():
+            param.requires_grad = name.startswith("layer4") or name.startswith("fc")
+        self.optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=0.001,
+        )
 
     def get_subset_indices(self, worker_name, dataset, subset_size=1000, seed=42):
         """
@@ -192,10 +198,8 @@ class TopologyProvider:
     def get_transform(self):
         """Get the transform needed for CIFAR-10."""
         return transforms.Compose([
-            transforms.Resize(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2430, 0.2610])
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]) 
     
     def load_cifar_data(self, subset_size=1000):
@@ -220,7 +224,7 @@ class TopologyProvider:
            for key in current_state.keys():
               if key in global_weights:
                  current_state[key] = 0.5 * current_state[key] + 0.5 * global_weights[key]
-           self.model.load_state_dict(global_weights)
+           self.model.load_state_dict(current_state)
 
         # Training loop
         for epoch in range(local_epochs): 

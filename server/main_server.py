@@ -146,7 +146,7 @@ import torch.nn as nn
 from torchvision import models
 
 def init_resnet(train_last_n_blocks=1):
-    base_model = models.resnet34(weights=None)
+    base_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     base_model.fc = nn.Linear(base_model.fc.in_features, 10)
 
     # Freeze everything first
@@ -208,8 +208,7 @@ def run_federated_training():
     surrogate_log = []
 
     # ---------------- Initialize models ----------------
-    #base_model = models.resnet18(weights=None)
-
+#    base_model = models.resnet18(weights=None)
     base_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     base_model.fc = torch.nn.Linear(base_model.fc.in_features, 10)
 #    base_model = init_resnet(train_last_n_blocks=2)  # train layer3 + layer4 + fc
@@ -243,7 +242,7 @@ def run_federated_training():
         if weights_fair is not None:
            base_model.load_state_dict(weights_fair)
            current_weights_awpsp = weights_fair
-           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=False)
+           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=True)
            accuracy_log.append((current_round, accuracy))
            var_u_log.append((current_round, var_u))
            surrogate_log.append((current_round, total_bias_bound))
@@ -253,6 +252,7 @@ def run_federated_training():
 
         # ---------------- AW-PSP branch ----------------
         # Node selection based on AW-PSP
+
 #        awpsp_model = models.resnet18(weights=None)
         awpsp_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         awpsp_model.fc = torch.nn.Linear(awpsp_model.fc.in_features, 10)
