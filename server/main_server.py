@@ -242,7 +242,7 @@ def run_federated_training():
         if weights_fair is not None:
            base_model.load_state_dict(weights_fair)
            current_weights_awpsp = weights_fair
-           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=True)
+           accuracy = shared_state.topology.evaluate_global_model(base_model, selected_nodes=selected, use_selected_nodes=True)
            accuracy_log.append((current_round, accuracy))
            var_u_log.append((current_round, var_u))
            surrogate_log.append((current_round, total_bias_bound))
@@ -269,7 +269,7 @@ def run_federated_training():
         if weights_awpsp is not None:
            current_weights_awpsp = weights_awpsp
            awpsp_model.load_state_dict(current_weights_awpsp)
-           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, use_selected_nodes=False)
+           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, selected_nodes=selected_awpsp, use_selected_nodes=False)
            awpsp_accuracy_log.append((current_round, accuracy_awpsp))
            awpsp_instant_fairness_log.append((current_round, awpsp_instant_var))
            awpsp_cumul_fairness_log.append((current_round, awpsp_cumul_var))
@@ -301,7 +301,7 @@ def run_federated_training():
         if weights_psp is not None:
            current_weights_psp = weights_psp
            psp_model.load_state_dict(current_weights_psp)
-           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, use_selected_nodes=False)
+           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, selected_nodes=selected_psp, use_selected_nodes=False)
            psp_accuracy_log.append((current_round, accuracy_psp))
            psp_instant_fairness_log.append((current_round, psp_instant_var))
            psp_cumul_fairness_log.append((current_round, psp_cumul_var))
