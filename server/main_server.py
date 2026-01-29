@@ -7,6 +7,7 @@ import os
 import csv
 import time
 import copy
+import math
 from torchvision import models
 from shared_state import topology
 import threading
@@ -217,6 +218,75 @@ def run_federated_training():
     current_weights_awpsp = base_model.state_dict()
     current_weights_psp = copy.deepcopy(current_weights_awpsp)
 
+
+    def compute_final_metrics(model=None, round_index=None):
+        if model is None:
+            model = base_model
+        if round_index is None:
+            round_index = current_round
+        nodes = list(shared_state.topology.dht.table.keys())
+        per_client_acc = shared_state.topology.evaluate_per_client_accuracy(model, nodes)
+        acc_values = [val for val in per_client_acc.values() if val is not None]
+        if not acc_values:
+            return None
+
+        avg_acc = sum(acc_values) / len(acc_values)
+        acc_variance = sum((val - avg_acc) ** 2 for val in acc_values) / len(acc_values)
+        acc_squared_sum = sum(val ** 2 for val in acc_values)
+        jain_acc = (sum(acc_values) ** 2) / (len(acc_values) * acc_squared_sum) if acc_squared_sum else 0.0
+
+        u_tilde_values = []
+        u_tilde_with_surrogate = []
+        for node in nodes:
+            if shared_state.topology.total_rounds_elapsed > 0:
+                pi_k = shared_state.topology.availability_counts[node] / shared_state.topology.total_rounds_elapsed
+                if pi_k > 0:
+                    u_k = shared_state.topology.utility_log[node]
+                    u_tilde_values.append(u_k / pi_k)
+                    surrogate_k = shared_state.topology.surrogate_contributions.get(node, 0.0)
+                    u_tilde_with_surrogate.append((u_k + surrogate_k) / pi_k)
+
+        def compute_utility_metrics(values):
+            if not values:
+                return None, None
+            mean_u = sum(values) / len(values)
+            std_u = math.sqrt(sum((val - mean_u) ** 2 for val in values) / len(values))
+            utility_cv = (std_u / mean_u) if mean_u != 0 else 0.0
+            squared_sum = sum(val ** 2 for val in values)
+            jain_utility = (sum(values) ** 2) / (len(values) * squared_sum) if squared_sum else 0.0
+            return utility_cv, jain_utility
+
+        selected_counts = [len(shared_state.topology.participation_log.get(node, [])) for node in nodes]
+        sel_gap = max(selected_counts) - min(selected_counts) if selected_counts else 0.0
+        if selected_counts and sum(selected_counts) > 0:
+            diffs = 0.0
+            for i in selected_counts:
+                for j in selected_counts:
+                    diffs += abs(i - j)
+            gini = diffs / (2 * len(selected_counts) * sum(selected_counts))
+        else:
+            gini = 0.0
+
+        utility_cv_no, jain_utility_no = compute_utility_metrics(u_tilde_values)
+        utility_cv_with, jain_utility_with = compute_utility_metrics(u_tilde_with_surrogate)
+
+        return {
+            "Round": round_index + 1,
+            "Avg Acc (No Surrogate)": avg_acc,
+            "Jain (Acc) (No Surrogate)": jain_acc,
+            "Utility CV (No Surrogate)": utility_cv_no,
+            "Jain (Utility) (No Surrogate)": jain_utility_no,
+            "Sel. Gap (No Surrogate)": sel_gap,
+            "Gini (No Surrogate)": gini,
+            "Avg Acc (With Surrogate)": avg_acc,
+            "Jain (Acc) (With Surrogate)": jain_acc,
+            "Utility CV (With Surrogate)": utility_cv_with,
+            "Jain (Utility) (With Surrogate)": jain_utility_with,
+            "Sel. Gap (With Surrogate)": sel_gap,
+            "Gini (With Surrogate)": gini,
+            "Acc Variance": acc_variance,
+        }
+
     num_rounds = 50
     for current_round in range(num_rounds):
         print(f"\n🌐 Federated Round {current_round + 1}")
@@ -321,6 +391,10 @@ def run_federated_training():
           for i in range(num_rounds):
             print(i, accuracy_log[i][1] if i < len(accuracy_log) else None, var_u_log[i][1] if i < len(var_u_log) else None, surrogate_log[i][1] if i < len(surrogate_log) else None, awpsp_accuracy_log[i][1] if i < len(awpsp_accuracy_log) else None, awpsp_instant_fairness_log[i][1] if i < len(awpsp_instant_fairness_log) else None,  awpsp_cumul_fairness_log[i][1] if i < len(awpsp_cumul_fairness_log) else None, corr_failure_log[i][1] if i < len(corr_failure_log) else None, awpsp_covered_labels_log[i][1] if i < len(awpsp_covered_labels_log) else None, psp_accuracy_log[i][1] if i < len(psp_accuracy_log) else None, psp_instant_fairness_log[i][1] if i < len(psp_instant_fairness_log) else None, psp_cumul_fairness_log[i][1] if i < len(psp_cumul_fairness_log) else None, psp_covered_labels_log[i][1] if i < len(psp_covered_labels_log) else None, selected_awpsp_log[i][1] if i < len(selected_awpsp_log) else None, selected_psp_log[i][1] if i < len(selected_psp_log) else None, awpsp_avg_score_log[i][1] if i < len(awpsp_avg_score_log) else None, psp_avg_score_log[i][1] if i < len(psp_avg_score_log) else None, awpsp_labels_log[i][1] if i < len(awpsp_labels_log) else None, psp_labels_log[i][1] if i < len(psp_labels_log) else None, awpsp_KL_log[i][1] if i < len(awpsp_KL_log) else None, psp_KL_log[i][1] if i < len(psp_KL_log) else None, awpsp_unseen_log[i][1] if i < len(awpsp_unseen_log) else None, psp_unseen_log[i][1] if i < len(psp_unseen_log) else None, awpsp_gini_log[i][1] if i < len(awpsp_gini_log) else None, psp_gini_log[i][1] if i < len(psp_gini_log) else None)
             writer.writerow([
+              i,
+              accuracy_log[i][1] if i < len(accuracy_log) else None,
+              var_u_log[i][1] if i < len(var_u_log) else None,
+              surrogate_log[i][1] if i < len(surrogate_log) else None,
               awpsp_accuracy_log[i][1] if i < len(awpsp_accuracy_log) else None,
               awpsp_instant_fairness_log[i][1] if i < len(awpsp_instant_fairness_log) else None,
               awpsp_cumul_fairness_log[i][1] if i < len(awpsp_cumul_fairness_log) else None,
@@ -331,8 +405,31 @@ def run_federated_training():
               psp_cumul_fairness_log[i][1] if i < len(psp_cumul_fairness_log) else None,
               psp_covered_labels_log[i][1] if i < len(psp_covered_labels_log) else None,
               selected_awpsp_log[i][1] if i < len(selected_awpsp_log) else None,
-              selected_psp_log[i][1] if i < len(selected_psp_log) else None
+              selected_psp_log[i][1] if i < len(selected_psp_log) else None,
+              awpsp_avg_score_log[i][1] if i < len(awpsp_avg_score_log) else None,
+              psp_avg_score_log[i][1] if i < len(psp_avg_score_log) else None,
+              awpsp_labels_log[i][1] if i < len(awpsp_labels_log) else None,
+              psp_labels_log[i][1] if i < len(psp_labels_log) else None,
+              awpsp_KL_log[i][1] if i < len(awpsp_KL_log) else None,
+              psp_KL_log[i][1] if i < len(psp_KL_log) else None,
+              awpsp_unseen_log[i][1] if i < len(awpsp_unseen_log) else None,
+              psp_unseen_log[i][1] if i < len(psp_unseen_log) else None,
+              awpsp_gini_log[i][1] if i < len(awpsp_gini_log) else None,
+              psp_gini_log[i][1] if i < len(psp_gini_log) else None,
         ])
+
+        summary = compute_final_metrics()
+        if summary:
+            print("Final metrics summary:")
+            for key, value in summary.items():
+                print(f"{key}: {value}")
+            write_header = not os.path.exists("final_metrics.csv")
+            with open("final_metrics.csv", "a") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(list(summary.keys()))
+                writer.writerow(list(summary.values()))
+
 
 
 def wait_for_latency_data(num_clients=3):

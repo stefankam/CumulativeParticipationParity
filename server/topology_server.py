@@ -296,6 +296,32 @@ class TopologyProvider:
         return accuracy
 
 
+    def evaluate_per_client_accuracy(self, model, nodes):
+        model.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+
+        full_dataset = datasets.CIFAR10(root='data/', train=True, download=False, transform=self.transform)
+        per_client_acc = {}
+
+        with torch.no_grad():
+            for node in nodes:
+                indices = self.fixed_indices.get(node, [])
+                if len(indices) == 0:
+                    per_client_acc[node] = None
+                    continue
+                subset = torch.utils.data.Subset(full_dataset, indices)
+                loader = DataLoader(subset, batch_size=32, shuffle=False)
+                correct = total = 0
+                for images, labels in loader:
+                    outputs = model(images)
+                    _, predicted = torch.max(outputs, 1)
+                    correct += (predicted == labels).sum().item()
+                    total += labels.size(0)
+                per_client_acc[node] = (100 * correct / total) if total else None
+
+        return per_client_acc
+
     def get_freshness(self, node, current_round):
         """Returns how long since this node was last selected."""
         last_selected_round = self.participation_log.get(node)
@@ -397,6 +423,7 @@ class TopologyProvider:
 
 
         return correlated_failures
+
 
 
     def select_fair_nodes(self, model, current_round, correlated_failures,  label_map, num_clients,  corr_threshold=0.35, lambda_=0.5, epsilon=1e-5):        
