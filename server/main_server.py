@@ -8,6 +8,7 @@ import csv
 import time
 import copy
 import math
+from typing import Dict, Tuple
 from torchvision import models
 from shared_state import topology
 import threading
@@ -16,6 +17,59 @@ import socket
 from topology_server import TopologyProvider
 import shared_state
 from availability import extract_availability_vectors
+
+def read_proc_stat() -> Tuple[int, int]:
+    with open("/proc/stat", "r") as f:
+        cpu_line = f.readline().strip().split()
+    values = list(map(int, cpu_line[1:]))
+    idle = values[3] + values[4]  # idle + iowait
+    total = sum(values)
+    return total, idle
+
+
+def read_meminfo() -> Dict[str, int]:
+    info = {}
+    with open("/proc/meminfo", "r") as f:
+        for line in f:
+            key, value = line.split(":", 1)
+            info[key.strip()] = int(value.strip().split()[0])
+    return info
+
+
+def read_diskstats() -> Dict[str, int]:
+    stats = {}
+    with open("/proc/diskstats", "r") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 14:
+                continue
+            name = parts[2]
+            if name.startswith("loop") or name.startswith("ram"):
+                continue
+            reads = int(parts[3])
+            writes = int(parts[7])
+            sectors_read = int(parts[5])
+            sectors_written = int(parts[9])
+            stats[name] = reads + writes + sectors_read + sectors_written
+    return stats
+
+
+def snapshot_system():
+    total, idle = read_proc_stat()
+    mem = read_meminfo()
+    disk = read_diskstats()
+    return total, idle, mem, disk
+
+
+def summarize_system(start, end):
+    total0, idle0, mem0, disk0 = start
+    total1, idle1, mem1, disk1 = end
+    cpu_delta = total1 - total0
+    idle_delta = idle1 - idle0
+    cpu_pct = 0.0 if cpu_delta == 0 else (1.0 - idle_delta / cpu_delta) * 100
+    mem_used_kb = mem1.get("MemTotal", 0) - mem1.get("MemAvailable", 0)
+    disk_delta = sum(disk1.values()) - sum(disk0.values())
+    return cpu_pct, mem_used_kb, disk_delta
 
 
 app = Flask(__name__)
@@ -291,6 +345,9 @@ def run_federated_training():
     for current_round in range(num_rounds):
         print(f"\n🌐 Federated Round {current_round + 1}")
 
+        round_start = time.perf_counter()
+        sys_start = snapshot_system()
+
         # Detect correlated failures
         correlated_failures = shared_state.topology.get_correlated_failure(
             current_round, availability_vectors, corr_threshold=0.35, num_neighbors=4
@@ -308,17 +365,19 @@ def run_federated_training():
             lambda_=0.5,
             epsilon=1e-5,
         )
+        selection_end = time.perf_counter()
         weights_fair = shared_state.topology.run_federated_round(selected, current_weights_awpsp, base_model)
         if weights_fair is not None:
            base_model.load_state_dict(weights_fair)
            current_weights_awpsp = weights_fair
-           accuracy = shared_state.topology.evaluate_global_model(base_model, selected_nodes=selected, use_selected_nodes=True)
+           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=False)
            accuracy_log.append((current_round, accuracy))
            var_u_log.append((current_round, var_u))
            surrogate_log.append((current_round, total_bias_bound))
            print(f"🔁 Round {current_round + 1}: Fair-Select Acc = {accuracy:.2f}%")
         else:
            print("⚠️ No updates received from clients. Skipping model update this round.")
+        fair_end = time.perf_counter()
 
         # ---------------- AW-PSP branch ----------------
         # Node selection based on AW-PSP
@@ -351,7 +410,7 @@ def run_federated_training():
            awpsp_gini_log.append((current_round, awpsp_gini))
         else:
            print("⚠️ No updates received from clients. Skipping model update this round.")
-
+        awpsp_end = time.perf_counter()
 
         # ---------------- PSP branch ----------------
         # Use a fresh model copy so AW-PSP doesn’t pollute PSP results
@@ -383,6 +442,8 @@ def run_federated_training():
            psp_gini_log.append((current_round, psp_gini))
         else:
            print("⚠️ No updates received from clients. Skipping model update this round.")
+
+        psp_end = time.perf_counter()
 
         # Save logs to CSV
         with open("metrics_log.csv", "w") as f:
@@ -418,7 +479,7 @@ def run_federated_training():
               psp_gini_log[i][1] if i < len(psp_gini_log) else None,
         ])
 
-        summary = compute_final_metrics()
+        summary = compute_final_metrics(base_model, current_round)
         if summary:
             print("Final metrics summary:")
             for key, value in summary.items():
@@ -430,6 +491,21 @@ def run_federated_training():
                     writer.writerow(list(summary.keys()))
                 writer.writerow(list(summary.values()))
 
+        sys_end = snapshot_system()
+        cpu_pct, mem_used_kb, disk_delta = summarize_system(sys_start, sys_end)
+        print(
+            "📊 Round timing: selection={:.2f}s fair={:.2f}s awpsp={:.2f}s psp={:.2f}s total={:.2f}s".format(
+                selection_end - round_start,
+                fair_end - selection_end,
+                awpsp_end - fair_end,
+                psp_end - awpsp_end,
+                psp_end - round_start,
+            )
+        )
+        print(
+            "🧮 System usage: CPU~{:.1f}% MemUsed~{:.1f}MB DiskDelta~{}"
+            .format(cpu_pct, mem_used_kb / 1024.0, disk_delta)
+        )
 
 
 def wait_for_latency_data(num_clients=3):
@@ -460,4 +536,4 @@ if __name__ == "__main__":
     threading.Thread(target=initialize_topology).start()
 
     # Step 3: Wait for latency info from clients, then start training
-    #threading.Thread(target=wait_for_latency_data).start()    
+    #threading.Thread(target=wait_for_latency_data).start()

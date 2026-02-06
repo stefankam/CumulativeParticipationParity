@@ -66,7 +66,6 @@ class TopologyProvider:
         self.previous_losses = {}  # Stores last loss per client
         self.transform = self.get_transform() 
         self.cifar_loader = self.load_cifar_data()
-        self.dnn_model = self.load_dnn_model(self.cifar_loader, model = models.resnet18(weights=None)) 
         self.dht = DHT(size=100)  # Initialize the DHT
         self.availability_predictor = AvailabilityPredictor(node_count=len(device_names) * num_workers)
         self.availability_predictor.load_history()
@@ -84,6 +83,7 @@ class TopologyProvider:
         # persistent model + optimizer inside each client
         self.model = models.resnet18(weights=None)
         self.model.fc = torch.nn.Linear(self.model.fc.in_features, 10)  # CIFAR-10
+        self.dnn_model = self.model
         self.criterion = torch.nn.CrossEntropyLoss()
 #        self.optimizer = optim.Adam(self.model.fc.parameters(), lr=0.001)
         for name, param in self.model.named_parameters():
@@ -93,7 +93,7 @@ class TopologyProvider:
             lr=0.001,
         )
 
-    def get_subset_indices(self, worker_name, dataset, subset_size=1000, seed=42):
+    def get_subset_indices(self, worker_name, dataset, subset_size=None,  seed=42):
         """
         Return non-IID training data indices per worker (by label).
         """
@@ -129,7 +129,7 @@ class TopologyProvider:
         return label_indices[:subset_size]
 
 
-    def get_subset_indices1(self, worker_name, total_size, subset_size=1000, seed=42):
+    def get_subset_indices1(self, worker_name, total_size, subset_size=None, seed=42):
         # Make subset selection deterministic per worker
         index = int(worker_name.replace("h", ""))
         random.seed(seed + index)
@@ -202,7 +202,7 @@ class TopologyProvider:
             transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2430, 0.2610])
         ]) 
     
-    def load_cifar_data(self, subset_size=1000):
+    def load_cifar_data(self, subset_size=None):
         """Load the CIFAR-10 dataset."""
         full_dataset = datasets.CIFAR10(root='data/', train=True, download=True, transform=self.transform)
 
@@ -210,9 +210,10 @@ class TopologyProvider:
 
         indices = self.get_subset_indices(worker_name, full_dataset, subset_size)
         print(f"client is: {worker_name}")
-        print(f"client label indices are: {indices}")        
-        filtered_dataset = torch.utils.data.Subset(full_dataset, indices)
-        train_loader = DataLoader(filtered_dataset, batch_size=32, shuffle=False)
+        indices = np.array(indices)
+        full_dataset.data = full_dataset.data[indices]
+        full_dataset.targets = [full_dataset.targets[i] for i in indices]
+        train_loader = DataLoader(full_dataset, batch_size=32, shuffle=False)
         return train_loader
 
 

@@ -12,6 +12,50 @@ import threading
 import requests
 import socket
 import argparse
+from typing import Dict, Tuple
+
+
+def read_proc_self_status() -> Dict[str, int]:
+    info = {}
+    with open("/proc/self/status", "r") as f:
+        for line in f:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            parts = value.strip().split()
+            if parts and parts[0].isdigit():
+                info[key.strip()] = int(parts[0])
+    return info
+
+
+def read_proc_self_io() -> Dict[str, int]:
+    io_stats = {}
+    with open("/proc/self/io", "r") as f:
+        for line in f:
+            key, value = line.split(":", 1)
+            io_stats[key.strip()] = int(value.strip())
+    return io_stats
+
+
+def snapshot_process():
+    wall = time.perf_counter()
+    cpu = time.process_time()
+    status = read_proc_self_status()
+    io_stats = read_proc_self_io()
+    return wall, cpu, status, io_stats
+
+
+def summarize_process(start, end):
+    wall0, cpu0, status0, io0 = start
+    wall1, cpu1, status1, io1 = end
+    wall_delta = max(wall1 - wall0, 1e-9)
+    cpu_pct = ((cpu1 - cpu0) / wall_delta) * 100.0
+    rss_kb = status1.get("VmRSS", 0)
+    io_read_delta = io1.get("read_bytes", 0) - io0.get("read_bytes", 0)
+    io_write_delta = io1.get("write_bytes", 0) - io0.get("write_bytes", 0)
+    return cpu_pct, rss_kb, io_read_delta, io_write_delta
+
+
 
 # -------------------------------
 # 1. INIT APP + GLOBAL OBJECTS
@@ -60,6 +104,8 @@ def train():
 #        return "Device unavailable", 503
 
     try:
+        train_start = time.perf_counter()
+        proc_start = snapshot_process()
         # Load posted weights
         raw_weights = request.files["weights"].read()
         state_dict = torch.load(io.BytesIO(raw_weights), map_location="cpu")
@@ -79,6 +125,12 @@ def train():
             )
         trace.advance()  # ⬅️ Move to next trace after training
         print("✅ Training completed. Advanced trace.")
+        proc_end = snapshot_process()
+        cpu_pct, rss_kb, io_read_delta, io_write_delta = summarize_process(proc_start, proc_end)
+        print(
+            "🧮 Client process usage: CPU~{:.1f}% RSS~{:.1f}MB IO(read/write)~{}/{} bytes TrainTime~{:.2f}s"
+            .format(cpu_pct, rss_kb / 1024.0, io_read_delta, io_write_delta, time.perf_counter() - train_start)
+        )
 
         
         # Return updated weights
