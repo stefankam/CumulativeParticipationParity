@@ -37,6 +37,10 @@ COPY traces/ traces/
 COPY topology_server.py .
 COPY shared_state.py .	
 COPY availability.py .
+COPY experiment_suite.py .
+COPY benchmark_suite.py .
+COPY fairness.py .
+COPY data/ data/
 
 # --------------------------
 # 5. Set environment

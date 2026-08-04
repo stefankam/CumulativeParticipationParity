@@ -273,7 +273,7 @@ def run_federated_training():
     current_weights_psp = copy.deepcopy(current_weights_awpsp)
 
 
-    def compute_final_metrics(model=None, round_index=None):
+    def compute_final_metrics(context, model=None, round_index=None):
         if model is None:
             model = base_model
         if round_index is None:
@@ -285,6 +285,8 @@ def run_federated_training():
             return None
 
         avg_acc = sum(acc_values) / len(acc_values)
+        global_accuracy = shared_state.topology.evaluate_global_model(
+            model, selected_nodes=None, use_selected_nodes=False)
         acc_variance = sum((val - avg_acc) ** 2 for val in acc_values) / len(acc_values)
         acc_squared_sum = sum(val ** 2 for val in acc_values)
         jain_acc = (sum(acc_values) ** 2) / (len(acc_values) * acc_squared_sum) if acc_squared_sum else 0.0
@@ -293,7 +295,7 @@ def run_federated_training():
         u_tilde_with_surrogate = []
         for node in nodes:
             if shared_state.topology.total_rounds_elapsed > 0:
-                pi_k = shared_state.topology.availability_counts[node] / shared_state.topology.total_rounds_elapsed
+                pi_k = shared_state.topology.availability_estimator.estimate(node)
                 if pi_k > 0:
                     u_k = shared_state.topology.utility_log[node]
                     u_tilde_values.append(u_k / pi_k)
@@ -326,6 +328,18 @@ def run_federated_training():
 
         return {
             "Round": round_index + 1,
+            "logical_population": context["logical_population"],
+            "selected_per_round": context["selected_per_round"],
+            "physical_clients": context["physical_clients"],
+            "split_mode": context["split_mode"],
+            "dirichlet_alpha": context["dirichlet_alpha"],
+            "selector_mode": context["selector_mode"],
+            "correlation_noise_pct": context["correlation_noise_pct"],
+            "seed": context["seed"],
+            "global_accuracy": global_accuracy,
+            "mean_client_accuracy": avg_acc,
+            "global_accuracy": global_accuracy,
+            "mean_client_accuracy": avg_acc,
             "Avg Acc (No Surrogate)": avg_acc,
             "Jain (Acc) (No Surrogate)": jain_acc,
             "Utility CV (No Surrogate)": utility_cv_no,
@@ -342,6 +356,7 @@ def run_federated_training():
         }
 
     num_rounds = 50
+
     for current_round in range(num_rounds):
         print(f"\n🌐 Federated Round {current_round + 1}")
 
@@ -362,7 +377,7 @@ def run_federated_training():
             num_clients=5,
             corr_threshold=0.35,
             label_map=label_map,
-            lambda_=0.5,
+            lambda_=float(os.getenv("LAMBDA_DECAY", "0.10")),
             epsilon=1e-5,
         )
         selection_end = time.perf_counter()
@@ -447,15 +462,22 @@ def run_federated_training():
 
         # Save logs to CSV
         with open("metrics_log.csv", "w") as f:
-          writer = csv.writer(f)
-          writer.writerow(["Round", "Select_Fair_Accuracy", "Select_Fair_variance", "Select_Fair_Surrogate", "AWPSP_Accuracy", "AWPSP_instant_fairness", "AWPSP_cumul_fairness","CorrelatedFailureCount", "AWPSP_CoveredLabelsCount", "PSP_Accuracy", "PSP_instant_fairness", "PSP_cumul_fairness", "PSP_CoveredLAbelsCount", "selected_awpsp", "selected_psp", "AWPSP Avg Score", "PSP Avg Score", "AWPSP labels", "PSP labels", "AWPSP KL", "PSP KL", "AWPSP unseen", "PSP unseen", "AWPSP gini", "PSP gini"])
-          for i in range(num_rounds):
-            print(i, accuracy_log[i][1] if i < len(accuracy_log) else None, var_u_log[i][1] if i < len(var_u_log) else None, surrogate_log[i][1] if i < len(surrogate_log) else None, awpsp_accuracy_log[i][1] if i < len(awpsp_accuracy_log) else None, awpsp_instant_fairness_log[i][1] if i < len(awpsp_instant_fairness_log) else None,  awpsp_cumul_fairness_log[i][1] if i < len(awpsp_cumul_fairness_log) else None, corr_failure_log[i][1] if i < len(corr_failure_log) else None, awpsp_covered_labels_log[i][1] if i < len(awpsp_covered_labels_log) else None, psp_accuracy_log[i][1] if i < len(psp_accuracy_log) else None, psp_instant_fairness_log[i][1] if i < len(psp_instant_fairness_log) else None, psp_cumul_fairness_log[i][1] if i < len(psp_cumul_fairness_log) else None, psp_covered_labels_log[i][1] if i < len(psp_covered_labels_log) else None, selected_awpsp_log[i][1] if i < len(selected_awpsp_log) else None, selected_psp_log[i][1] if i < len(selected_psp_log) else None, awpsp_avg_score_log[i][1] if i < len(awpsp_avg_score_log) else None, psp_avg_score_log[i][1] if i < len(psp_avg_score_log) else None, awpsp_labels_log[i][1] if i < len(awpsp_labels_log) else None, psp_labels_log[i][1] if i < len(psp_labels_log) else None, awpsp_KL_log[i][1] if i < len(awpsp_KL_log) else None, psp_KL_log[i][1] if i < len(psp_KL_log) else None, awpsp_unseen_log[i][1] if i < len(awpsp_unseen_log) else None, psp_unseen_log[i][1] if i < len(psp_unseen_log) else None, awpsp_gini_log[i][1] if i < len(awpsp_gini_log) else None, psp_gini_log[i][1] if i < len(psp_gini_log) else None)
+            writer = csv.writer(f)
+            if current_round == 0:
+                writer.writerow(metrics_header)
             writer.writerow([
-              i,
-              accuracy_log[i][1] if i < len(accuracy_log) else None,
-              var_u_log[i][1] if i < len(var_u_log) else None,
-              surrogate_log[i][1] if i < len(surrogate_log) else None,
+              current_round,
+              experiment_context["logical_population"],
+              experiment_context["selected_per_round"],
+              experiment_context["physical_clients"],
+              experiment_context["split_mode"],
+              experiment_context["dirichlet_alpha"],
+              experiment_context["selector_mode"],
+              experiment_context["correlation_noise_pct"],
+              experiment_context["seed"],
+              accuracy_log[-1][1] if accuracy_log else None,
+              var_u_log[-1][1] if var_u_log else None,
+              surrogate_log[-1][1] if surrogate_log else None,
               awpsp_accuracy_log[i][1] if i < len(awpsp_accuracy_log) else None,
               awpsp_instant_fairness_log[i][1] if i < len(awpsp_instant_fairness_log) else None,
               awpsp_cumul_fairness_log[i][1] if i < len(awpsp_cumul_fairness_log) else None,
@@ -479,7 +501,7 @@ def run_federated_training():
               psp_gini_log[i][1] if i < len(psp_gini_log) else None,
         ])
 
-        summary = compute_final_metrics(base_model, current_round)
+        summary = compute_final_metrics(experiment_context, base_model, current_round)
         if summary:
             print("Final metrics summary:")
             for key, value in summary.items():

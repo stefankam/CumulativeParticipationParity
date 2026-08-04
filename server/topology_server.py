@@ -25,6 +25,7 @@ from sklearn.metrics import accuracy_score, precision_score
 import random
 import json
 import time
+from fairness import FairnessSchedulerController, UtilityTracker, surrogate_weight
 from torchvision import datasets
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
@@ -37,7 +38,11 @@ class TopologyProvider:
         self.link_loss = (1 - np.sqrt(1 - link_loss / 100)) * 100 if link_loss else None
         self.num_epochs = num_epochs
         self.model_name = model_name
-        self.utility_log = defaultdict(float)  # Tracks cumulative utility u_k(T)
+        self.utility_definition = os.getenv("UTILITY_DEFINITION", "auc").lower()
+        self.utility_tracker = UtilityTracker(
+            self.utility_definition,
+            max_increment=float(os.getenv("UTILITY_MAX_INCREMENT", "1.0")))
+        self.utility_log = defaultdict(float)  # compatibility view of cumulative U_k(T)
         self.previous_losses = {}  # Stores last loss per client
         self.transform = self.get_transform() 
         self.fixed_indices = {}
@@ -63,6 +68,20 @@ class TopologyProvider:
         self.probation_rounds = {}    # when node first recovered
         self.recovery_threshold = 4   # rounds to wait before marking as recovered
         self.probation_duration = 3   # rounds to weight updates less
+
+        self.logical_labels_per_client = int(os.getenv("LOGICAL_LABELS_PER_CLIENT", "2"))
+        window = int(os.getenv("AVAILABILITY_WINDOW_SIZE", "50"))
+        self.selection_mode = os.getenv("SELECTION_MODE", "cup").lower()
+        self.lambda_decay = float(os.getenv("LAMBDA_DECAY", "0.10"))
+        self.fairness_scheduler = FairnessSchedulerController(
+            self.devices, mode=self.selection_mode, window_size=window,
+            seed=int(os.getenv("EXPERIMENT_SEED", "0")),
+            lambda_reactive=self.lambda_decay)
+        # Read-only compatibility alias; scheduling implementation lives in fairness.py.
+        self.availability_estimator = self.fairness_scheduler.estimator
+        self.surrogate_mode = os.getenv("SURROGATE_MODE", "accounting").lower()
+
+
 
     def get_subset_indices(self, worker_name, dataset, subset_size=1000, seed=42):
         """
@@ -350,7 +369,13 @@ class TopologyProvider:
    
         # 1. Compute trace-based correlation matrix
         device_ids = list(availability_vectors.keys())
-        matrix = np.corrcoef([availability_vectors[d] for d in device_ids])
+        # Pearson correlation is undefined for a constant trace.  NumPy emits
+        # RuntimeWarning and returns NaN in that case; treat undefined pairs as
+        # uncorrelated so they cannot become false correlated-failure edges.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            matrix = np.corrcoef([availability_vectors[d] for d in device_ids])
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+        np.fill_diagonal(matrix, 1.0)
         device_idx = {f"h{int(device[1:]) - 1}": idx for idx, device in enumerate(device_ids)}
         print("device_idx :", device_idx)
         # 2. Compute proximity-based neighbors
@@ -426,18 +451,21 @@ class TopologyProvider:
 
 
 
-    def select_fair_nodes(self, model, current_round, correlated_failures,  label_map, num_clients,  corr_threshold=0.35, lambda_=0.5, epsilon=1e-5):        
+    def select_fair_nodes(self, model, current_round, correlated_failures,  label_map, num_clients,  corr_threshold=0.35, lambda_=None, epsilon=1e-5):        
         """
         - Select a subset of active nodes with:
         - Inverse availability × reactive reweighting (fairness-aware)
         - Class (label) coverage
         """
         eta_0 = 1.0         # base surrogate weight
-        lambda_ = 0.5       # decay rate (can be tuned or swept)
+
 
         # 1. Get active nodes
         correlated_nodes = {n for pair in correlated_failures for n in pair}
-        active_hosts = [node for node, metadata in self.dht.table.items() if node not in self.failed_nodes and node not in correlated_nodes]
+        telemetry = {node: bool(metadata.get("availability", False)) for node, metadata in self.dht.table.items()}
+        self.fairness_scheduler.observe_telemetry(telemetry)
+        active_hosts = [node for node in self.dht.table
+                        if telemetry[node] and node not in self.failed_nodes and node not in correlated_nodes]
         all_hosts = [node for node, metadata in self.dht.table.items()]
         print(f"❌ Failed Hosts: {self.failed_nodes}")
         print("✅ Active Hosts:", active_hosts)
@@ -464,7 +492,7 @@ class TopologyProvider:
             if node in self.last_model_states:
                past_model_state, last_seen = self.last_model_states[node]
                delta = current_round - last_seen
-               eta_k = eta_0 * math.exp(-lambda_ * delta)
+               eta_k = surrogate_weight(eta_0, lambda_decay, delta)
 
                # Load old model to surrogate
                surrogate_model = models.resnet18(weights=None)
@@ -493,42 +521,29 @@ class TopologyProvider:
         print(f"📉 Total surrogate contribution (bias bound): {total_bias_bound:.4f}")
 
 
-        # 2. Compute inverse-availability × missed-round score
-        scores = []
-        for node in active_hosts:
-            # Estimate π_k
-            self.availability_counts[node] += 1
-            if self.total_rounds_elapsed > 0:
-               pi_k = self.availability_counts[node] / (self.total_rounds_elapsed)
-            else:
-               pi_k = 0
 
-            # Missed rounds since last participation
-            last_rounds = self.participation_log.get(node, [])
-            last_selected = max(last_rounds) if last_rounds else 0
-            print("last_selected: ",last_selected)
-            missed = current_round - last_selected
-            print("missed: ",missed)
-
-            # Final score: inverse availability × reactive boost
-            if pi_k > 0:
-               score = (1 / pi_k ) * (1 + lambda_ * missed)
-            else:
-               score = 0
-            scores.append((node, score))
-            print("scores: ", (node, score))
-
-        # 3. Sort nodes by fairness-aware score
-        scores.sort(key=lambda x: x[1], reverse=True)
-
-        # 4. Greedily select nodes with label coverage
-        selected = set()
+        estimates = self.availability_estimator.estimates(all_hosts)
+        for node in all_hosts:
+            self.availability_counts[node] = round(
+                estimates[node] * self.availability_estimator.observation_count(node))
+        mu_hat = {}
+        for node in all_hosts:
+            history = self.utility_tracker.utility_history.get(node, [])
+            positive = [value for value in history if value > 0]
+            mu_hat[node] = sum(positive) / len(positive) if positive else 1.0
+        scheduled = self.fairness_scheduler.select(
+            telemetry=telemetry, capacity=num_clients, mu_hat=mu_hat,
+            budget=min(num_clients, sum(estimates.values())))
+        selected = []
         covered_labels = set()
 
-        for node, _ in scores:
+        for node in scheduled:
+            if node not in active_hosts:  # P_k(t) = A_k(t) S_k(t)
+                continue
             node_labels = set(label_map.get(node, []))
             if not node_labels.issubset(covered_labels) or len(selected) < num_clients:
-               selected.add(node)
+
+               selected.append(node)
                covered_labels.update(node_labels)
             if len(selected) >= num_clients:
                break 
@@ -546,13 +561,16 @@ class TopologyProvider:
         self.total_rounds_elapsed += 1
         print("total_rounds_elapsed: ", self.total_rounds_elapsed)
         self.update_participation_log(selected, current_round)
-
+        self.fairness_scheduler.end_round(selected)
 
         # 6. Evaluate ΔF_k(t) and update u_k
         loss_fn = torch.nn.CrossEntropyLoss()
         for node in selected:
             host = self.dht.table[node]
             relevant_losses = []
+            correct_predictions = 0
+            total_predictions = 0
+
 
             for image, label in node_test_loaders[node]:
  
@@ -564,17 +582,18 @@ class TopologyProvider:
                  output = model(image)
                  loss = loss_fn(output, label).item()
                  relevant_losses.append(loss)
+                 correct_predictions += (output.argmax(dim=1) == label).sum().item()
+                 total_predictions += label.numel()
+
  
             if relevant_losses:
               avg_loss = sum(relevant_losses) / len(relevant_losses)
 
-              # Compute utility as positive delta from previous loss
-              prev = self.previous_losses.get(node, None)
-              if prev is not None:
-                 delta_f = max(0, prev - avg_loss)
-                 self.utility_log[node] += delta_f
-
               # Save loss for next round
+
+              accuracy = correct_predictions / total_predictions if total_predictions else 0.0
+              self.utility_tracker.observe(node, accuracy=accuracy, loss=avg_loss)
+              self.utility_log[node] = self.utility_tracker.cumulative(node)
               self.previous_losses[node] = avg_loss
 
 
@@ -582,12 +601,11 @@ class TopologyProvider:
         normalized_utilities = []
         for node in self.utility_log:
             if self.total_rounds_elapsed > 0:
-               pi_k = self.availability_counts[node] / self.total_rounds_elapsed
+               pi_k = self.availability_estimator.estimate(node)
                u_k = self.utility_log[node]
                print(f"for node {node}, pi_k = {pi_k} and u_k = {u_k}") 
                if pi_k > 0:
-                  avg_u_k = u_k / self.total_rounds_elapsed
-                  u_tilde_k = avg_u_k / pi_k
+                  u_tilde_k = u_k / pi_k
                   normalized_utilities.append(u_tilde_k)
         var_u = 0.0
         if normalized_utilities:

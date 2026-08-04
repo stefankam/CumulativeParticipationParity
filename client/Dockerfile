@@ -31,7 +31,7 @@ WORKDIR /app
 COPY main_client.py .
 COPY topology_client.py .
 COPY availability.py .
-
+COPY data/ data/
 COPY traces/ traces/
 
 RUN apt-get update && apt-get install -y iputils-ping
