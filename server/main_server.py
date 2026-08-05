@@ -17,6 +17,10 @@ import socket
 from topology_server import TopologyProvider
 import shared_state
 from availability import extract_availability_vectors
+import numpy as np
+import json
+from collections import defaultdict
+
 
 def read_proc_stat() -> Tuple[int, int]:
     with open("/proc/stat", "r") as f:
@@ -229,8 +233,51 @@ def init_resnet(train_last_n_blocks=1):
 
 def run_federated_training():
     global current_round
-    if shared_state.topology is None:
-        raise RuntimeError("❌ Topology has not been initialized.")
+
+    seed = int(os.getenv("EXPERIMENT_SEED", "42"))
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    logical_client_count = int(os.getenv("LOGICAL_CLIENT_COUNT", "100"))
+    physical_container_limit = int(os.getenv("PHYSICAL_CONTAINER_LIMIT", "10"))
+    logical_selected_per_round = int(os.getenv("LOGICAL_SELECTED_PER_ROUND", "10"))
+    use_logical_scheduling = os.getenv(
+        "USE_LOGICAL_SCHEDULING", "true").lower() in ("1", "true", "yes", "on")
+    logical_labels_per_client = int(os.getenv("LOGICAL_LABELS_PER_CLIENT", "2"))
+    split_mode = os.getenv("LOGICAL_SPLIT_MODE", "extreme")
+    dirichlet_alpha = float(os.getenv("DIRICHLET_ALPHA", "0.5"))
+    selector_mode = os.getenv("SELECTOR_MODE", "awpsp").lower()
+    corr_noise_pct = float(os.getenv("CORRELATION_NOISE_PCT", "0.0"))
+
+    experiment_context = {
+        "logical_population": logical_client_count,
+        "selected_per_round": logical_selected_per_round,
+        "physical_clients": physical_container_limit,
+        "split_mode": split_mode,
+        "dirichlet_alpha": dirichlet_alpha,
+        "selector_mode": selector_mode,
+        "correlation_noise_pct": corr_noise_pct,
+        "seed": seed,
+    }
+    print(
+        "🧪 Active experiment context: "
+        + json.dumps(experiment_context, sort_keys=True),
+        flush=True,
+    )
+    
+    metrics_log_path = os.getenv("METRICS_LOG_PATH", "metrics_log.csv")
+    final_metrics_path = os.getenv("FINAL_METRICS_PATH", "final_metrics.csv")
+    logical_participation_awpsp = defaultdict(int)
+    logical_participation_psp = defaultdict(int)
+    logical_participation_oort = defaultdict(int)
+    logical_participation_log = defaultdict(int)
+    # Oort-style selector state (utility/reward + exploration + duration penalty).
+    oort_pull_count = defaultdict(int)
+    oort_utility_ema = defaultdict(float)
+    oort_duration_ema = defaultdict(lambda: 1.0)
+    logical_loss_history_awpsp = defaultdict(list)
+    logical_loss_history_psp = defaultdict(list)
+    logical_loss_history_oort = defaultdict(list)
+
 
     label_map = shared_state.topology.label_map
 
@@ -460,46 +507,65 @@ def run_federated_training():
 
         psp_end = time.perf_counter()
 
-        # Save logs to CSV
+
         with open("metrics_log.csv", "w") as f:
             writer = csv.writer(f)
             if current_round == 0:
-                writer.writerow(metrics_header)
-            writer.writerow([
-              current_round,
-              experiment_context["logical_population"],
-              experiment_context["selected_per_round"],
-              experiment_context["physical_clients"],
-              experiment_context["split_mode"],
-              experiment_context["dirichlet_alpha"],
-              experiment_context["selector_mode"],
-              experiment_context["correlation_noise_pct"],
-              experiment_context["seed"],
-              accuracy_log[-1][1] if accuracy_log else None,
-              var_u_log[-1][1] if var_u_log else None,
-              surrogate_log[-1][1] if surrogate_log else None,
-              awpsp_accuracy_log[i][1] if i < len(awpsp_accuracy_log) else None,
-              awpsp_instant_fairness_log[i][1] if i < len(awpsp_instant_fairness_log) else None,
-              awpsp_cumul_fairness_log[i][1] if i < len(awpsp_cumul_fairness_log) else None,
-              corr_failure_log[i][1] if i < len(corr_failure_log) else None,
-              awpsp_covered_labels_log[i][1] if i < len(awpsp_covered_labels_log) else None,
-              psp_accuracy_log[i][1] if i < len(psp_accuracy_log) else None,
-              psp_instant_fairness_log[i][1] if i < len(psp_instant_fairness_log) else None,
-              psp_cumul_fairness_log[i][1] if i < len(psp_cumul_fairness_log) else None,
-              psp_covered_labels_log[i][1] if i < len(psp_covered_labels_log) else None,
-              selected_awpsp_log[i][1] if i < len(selected_awpsp_log) else None,
-              selected_psp_log[i][1] if i < len(selected_psp_log) else None,
-              awpsp_avg_score_log[i][1] if i < len(awpsp_avg_score_log) else None,
-              psp_avg_score_log[i][1] if i < len(psp_avg_score_log) else None,
-              awpsp_labels_log[i][1] if i < len(awpsp_labels_log) else None,
-              psp_labels_log[i][1] if i < len(psp_labels_log) else None,
-              awpsp_KL_log[i][1] if i < len(awpsp_KL_log) else None,
-              psp_KL_log[i][1] if i < len(psp_KL_log) else None,
-              awpsp_unseen_log[i][1] if i < len(awpsp_unseen_log) else None,
-              psp_unseen_log[i][1] if i < len(psp_unseen_log) else None,
-              awpsp_gini_log[i][1] if i < len(awpsp_gini_log) else None,
-              psp_gini_log[i][1] if i < len(psp_gini_log) else None,
-        ])
+                writer.writerow([
+                    "Round", "logical_population", "selected_per_round",
+                    "physical_clients", "split_mode", "dirichlet_alpha",
+                    "selector_mode", "correlation_noise_pct", "seed",
+                    "Select_Fair_Accuracy", "Select_Fair_variance",
+                    "Select_Fair_Surrogate", "AWPSP_Accuracy",
+                    "AWPSP_instant_fairness", "AWPSP_cumul_fairness",
+                    "CorrelatedFailureCount", "AWPSP_CoveredLabelsCount",
+                    "PSP_Accuracy", "PSP_instant_fairness", "PSP_cumul_fairness",
+                    "PSP_CoveredLAbelsCount", "selected_awpsp", "selected_psp",
+                    "AWPSP Avg Score", "PSP Avg Score", "AWPSP labels",
+                    "PSP labels", "AWPSP KL", "PSP KL", "AWPSP unseen",
+                    "PSP unseen", "AWPSP gini", "PSP gini",
+                ])
+
+            i = current_round
+            metrics_values = [
+                i,
+                experiment_context["logical_population"],
+                experiment_context["selected_per_round"],
+                experiment_context["physical_clients"],
+                experiment_context["split_mode"],
+                experiment_context["dirichlet_alpha"],
+                experiment_context["selector_mode"],
+                experiment_context["correlation_noise_pct"],
+                experiment_context["seed"],
+
+                accuracy_log[i][1] if i < len(accuracy_log) else None,
+                var_u_log[i][1] if i < len(var_u_log) else None,
+                surrogate_log[i][1] if i < len(surrogate_log) else None,
+                awpsp_accuracy_log[i][1] if i < len(awpsp_accuracy_log) else None,
+                awpsp_instant_fairness_log[i][1] if i < len(awpsp_instant_fairness_log) else None,
+                awpsp_cumul_fairness_log[i][1] if i < len(awpsp_cumul_fairness_log) else None,
+                corr_failure_log[i][1] if i < len(corr_failure_log) else None,
+                awpsp_covered_labels_log[i][1] if i < len(awpsp_covered_labels_log) else None,
+                psp_accuracy_log[i][1] if i < len(psp_accuracy_log) else None,
+                psp_instant_fairness_log[i][1] if i < len(psp_instant_fairness_log) else None,
+                psp_cumul_fairness_log[i][1] if i < len(psp_cumul_fairness_log) else None,
+                psp_covered_labels_log[i][1] if i < len(psp_covered_labels_log) else None,
+                selected_awpsp_log[i][1] if i < len(selected_awpsp_log) else None,
+                selected_psp_log[i][1] if i < len(selected_psp_log) else None,
+                awpsp_avg_score_log[i][1] if i < len(awpsp_avg_score_log) else None,
+                psp_avg_score_log[i][1] if i < len(psp_avg_score_log) else None,
+                awpsp_labels_log[i][1] if i < len(awpsp_labels_log) else None,
+                psp_labels_log[i][1] if i < len(psp_labels_log) else None,
+                awpsp_KL_log[i][1] if i < len(awpsp_KL_log) else None,
+                psp_KL_log[i][1] if i < len(psp_KL_log) else None,
+                awpsp_unseen_log[i][1] if i < len(awpsp_unseen_log) else None,
+                psp_unseen_log[i][1] if i < len(psp_unseen_log) else None,
+                awpsp_gini_log[i][1] if i < len(awpsp_gini_log) else None,
+                psp_gini_log[i][1] if i < len(psp_gini_log) else None,
+            ]
+            print(*metrics_values)
+            writer.writerow(metrics_values)
+
 
         summary = compute_final_metrics(experiment_context, base_model, current_round)
         if summary:

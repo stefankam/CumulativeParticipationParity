@@ -868,7 +868,10 @@ class TopologyProvider:
         scores = []
         for node, meta in self.dht.table.items():
             if node in active_hosts:
-               availability = meta["availability"]
+               # Status telemetry can race with round startup or come from an
+               # older cached registration lacking this key. Missing/None A is
+               # unavailable, not a reason to terminate the training loop.
+               availability = bool(meta.get("availability", False))
                print("availability: ", availability)
                freshness = self.get_freshness(node, current_round)
                print("freshness: ", freshness)
