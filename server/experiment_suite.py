@@ -46,6 +46,14 @@ SUMMARY = ROOT / "results_summary.csv"
 RUN_DIR = ROOT / "experiment_runs"
 BENCHMARK_RESULTS = ROOT / "benchmark_results.csv"
 GRAPH_DIR = ROOT / "benchmark_graphs"
+SUITE_FORMAT_VERSION = 2
+
+BENCHMARK_FIELDS = [
+    "dataset", "seed", "method", "availability_model", "ablation",
+    "global_accuracy", "mean_client_accuracy", "worst_10_percent_utility",
+    "utility_cv", "utility_jain_index", "conditional_selection_gap",
+    "runtime_seconds",
+]
 
 
 def confidence_interval(values):
@@ -60,6 +68,7 @@ def confidence_interval(values):
 
 
 def last_awpsp_accuracy(metrics_path):
+    metrics_path = Path(metrics_path)
     if not metrics_path.exists():
         return None
     with metrics_path.open() as f:
@@ -68,16 +77,119 @@ def last_awpsp_accuracy(metrics_path):
         return None
     val = rows[-1].get("AWPSP_Accuracy")
     return float(val) if val not in (None, "") else None
+    # A round can legitimately have no update.  Use the most recent completed
+    # AW-PSP measurement rather than assuming the last CSV row is populated.
+    for row in reversed(rows):
+        val = row.get("AWPSP_Accuracy")
+        if val not in (None, ""):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def completed_metric_rounds(metrics_path):
+    """Count distinct round rows actually persisted by the child process."""
+    metrics_path = Path(metrics_path)
+    if not metrics_path.exists():
+        return 0
+    with metrics_path.open() as handle:
+        rounds = {
+            row.get("Round")
+            for row in csv.DictReader(handle)
+            if row.get("Round") not in (None, "")
+        }
+    return len(rounds)
+
+
+def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
+                            include_in_progress=False):
+    """Convert successful suite final-metric files into graph-ready rows.
+
+    No values are synthesized: a run is omitted if it failed, is incomplete, or
+    lacks any metric required by :mod:`benchmark_suite`.
+    """
+    benchmark_rows = []
+    for run in rows:
+        if run["return_code"] != 0:
+            continue
+        if (not include_in_progress
+                and run["completed_rounds"] < run["expected_rounds"]):
+            continue
+        final_path = Path(run["final_metrics_path"])
+        if not final_path.exists():
+            continue
+        with final_path.open(newline="") as handle:
+            final_rows = list(csv.DictReader(handle))
+        if not final_rows:
+            continue
+        final = final_rows[-1]
+        use_surrogate = run["ablation"] in {"surrogate", "full_method"}
+        suffix = "With Surrogate" if use_surrogate else "No Surrogate"
+        candidate = {
+            "dataset": run["dataset"],
+            "seed": run["seed"],
+            "method": run["selector"],
+            "availability_model": run["availability_model"],
+            "ablation": run["ablation"],
+            "global_accuracy": final.get("global_accuracy"),
+            "mean_client_accuracy": final.get("mean_client_accuracy"),
+            "worst_10_percent_utility": final.get("worst_10_percent_utility"),
+            "utility_cv": final.get(f"Utility CV ({suffix})"),
+            "utility_jain_index": final.get(f"Jain (Utility) ({suffix})"),
+            "conditional_selection_gap": final.get(f"Sel. Gap ({suffix})"),
+            "runtime_seconds": final.get("runtime_seconds"),
+        }
+        if all(candidate[field] not in (None, "") for field in BENCHMARK_FIELDS):
+            benchmark_rows.append(candidate)
+
+    with Path(destination).open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=BENCHMARK_FIELDS)
+        writer.writeheader()
+        writer.writerows(benchmark_rows)
+    return benchmark_rows
+
+
+def write_experiment_results(rows, fieldnames, destination=OUT):
+    """Rewrite the live suite index so every run has at most one current row."""
+    with Path(destination).open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_results_summary(rows, destination=SUMMARY):
+    """Rewrite seed aggregates from all measurements available so far."""
+    grouped = {}
+    for row in rows:
+        key = (row["N"], row["m"], row["split_mode"],
+               row["labels_per_client"], row["selector"], row["noise_pct"])
+        grouped.setdefault(key, []).append(row["awpsp_accuracy_last"])
+
+    fieldnames = ["N", "m", "split_mode", "labels_per_client", "selector",
+                  "noise_pct", "mean", "standard_deviation", "ci95_low",
+                  "ci95_high"]
+    with Path(destination).open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for key, values in grouped.items():
+            clean = [value for value in values if isinstance(value, (float, int))]
+            mean, ci = confidence_interval(clean)
+            std = statistics.stdev(clean) if len(clean) > 1 else 0.0
+            writer.writerow(dict(zip(fieldnames[:6], key), mean=mean,
+                                 standard_deviation=std, ci95_low=mean - ci,
+                                 ci95_high=mean + ci))
 
 
 
-
-def run_case(env_overrides, run_tag):
+def run_case(env_overrides, run_tag, progress_callback=None):
     env = os.environ.copy()
     env.update({k: str(v) for k, v in env_overrides.items()})
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     metrics_path = RUN_DIR / f"metrics_{run_tag}.csv"
     final_path = RUN_DIR / f"final_{run_tag}.csv"
+    log_path = RUN_DIR / f"run_{run_tag}.log"
     python_bin = os.getenv("PYTHON_BIN", sys.executable or "python3")
     cmd = [python_bin, str(MAIN_SERVER.relative_to(ROOT))]
 
@@ -89,52 +201,102 @@ def run_case(env_overrides, run_tag):
     print(f"[suite] metrics: {metrics_path}", flush=True)
 
     tail = deque(maxlen=4000)
-    process = subprocess.Popen(
-        cmd,
-        cwd=ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
+    diagnostic_tail = deque(maxlen=200)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
 
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(line, end="", flush=True)
-        tail.append(line)
+
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            log_file.write(line)
+            log_file.flush()
+            tail.append(line)
+            if any(marker in line for marker in (
+                    "Error", "Exception", "Traceback", "No updates received",
+                    "No fair-select updates", "No AW-PSP updates",
+                    "No OORT updates", "No PSP updates",
+                    "unavailable", "failed after")):
+                diagnostic_tail.append(line)
+            if progress_callback is not None:
+                progress_callback(metrics_path, final_path)
 
     process.wait()
     merged_tail = ''.join(tail)
     acc = last_awpsp_accuracy(metrics_path)
+    return_code = process.returncode
+    expected_rounds = int(env_overrides.get("NUM_ROUNDS", 50))
+    completed_rounds = completed_metric_rounds(metrics_path)
+    if return_code == 0 and completed_rounds < expected_rounds:
+        return_code = 3
+        diagnostic_tail.append(
+            f"[suite] ERROR: child exited normally after persisting {completed_rounds}/{expected_rounds} "
+            f"rounds. This is not a completed suite run; inspect the full child log at {log_path}.\n")
+        diagnostic_tail.append("[suite] final child-output tail follows:\n")
+        diagnostic_tail.append(merged_tail[-4000:])
+    elif return_code == 0 and acc is None:
+        return_code = 2
+        diagnostic_tail.append(
+            "[suite] ERROR: process exited successfully but produced no AWPSP_Accuracy; "
+            f"inspect {log_path}\n")
+    reported_tail = ''.join(diagnostic_tail) or merged_tail[-4000:]
+    reported_tail = f"[full_log={log_path}]\n{reported_tail}"
+    # Six values; keep this contract synchronized with the six targets in run_suite().
+    return return_code, acc, reported_tail[-8000:], "", str(metrics_path), str(final_path)
 
-    return process.returncode, acc, merged_tail[-4000:], "", str(metrics_path), str(final_path)
 
-
-
-def run_suite():
-    print(f"[suite] ROOT={ROOT} MAIN_SERVER={MAIN_SERVER}", flush=True)
+def run_suite(live_graphs=False):
+    print(
+        f"[suite] format={SUITE_FORMAT_VERSION} ROOT={ROOT} MAIN_SERVER={MAIN_SERVER}",
+        flush=True,
+    )
     populations = [100]
     selections = [10]
     split_modes = ["overlap"]
     labels_per_client_options = [2]
     selectors = ["awpsp"]
     noises = [0]
-    seeds = [0]
+    seeds = [0, 1, 2, 3, 4]
+    rounds_per_run = int(os.getenv("NUM_ROUNDS", "50"))
+    dataset = os.getenv("DATASET", "cifar10").lower()
+    availability_model = os.getenv("AVAILABILITY_MODEL", "independent").lower()
+    ablation = os.getenv("ABLATION", "no_surrogate").lower()
+
 
     rows = []
     result_fields = [
-        "N", "m", "split_mode", "labels_per_client", "selector",  "noise_pct", "seed",
-        "return_code", "awpsp_accuracy_last", "stdout_tail", "stderr_tail",
+        "N", "m", "split_mode", "labels_per_client", "selector", "noise_pct", "seed",
+        "dataset", "availability_model", "ablation",
+        "return_code", "completed_rounds", "expected_rounds", "awpsp_accuracy_last", "stdout_tail", "stderr_tail",
         "metrics_path", "final_metrics_path"
     ]
-    with OUT.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=result_fields)
-        writer.writeheader()
+    # Create every public artifact before the first child starts. They are then
+    # refreshed after each persisted federated round, not only after the suite.
+    write_experiment_results(rows, result_fields)
+    write_results_summary(rows)
+    write_benchmark_results(rows, include_in_progress=True)
 
-    total = len(populations) * len(selections) * len(split_modes) * len(labels_per_client_options) * len(selectors) * len(noises) * len(seeds)
+    total_runs = len(populations) * len(selections) * len(split_modes) * len(labels_per_client_options) * len(selectors) * len(noises) * len(seeds)
+    total_federated_rounds = total_runs * rounds_per_run
+    print(
+        "[suite] matrix dimensions: "
+        f"populations={len(populations)} selections={len(selections)} "
+        f"split_modes={len(split_modes)} labels={len(labels_per_client_options)} "
+        f"selectors={len(selectors)} noises={len(noises)} seeds={len(seeds)}; "
+        f"child_runs={total_runs}; rounds_per_run={rounds_per_run}; "
+        f"maximum_federated_rounds={total_federated_rounds}",
+        flush=True,
+    )
     done = 0
     for n in populations:
         for m in selections:
@@ -145,72 +307,105 @@ def run_suite():
                             for seed in seeds:
                                 run_tag = f"N{n}_m{m}_{split}_labels{labels_per_client}_{selector}_noise{noise}_seed{seed}"
 
+                                live_row = {
+                                    "N": n, "m": m, "split_mode": split,
+                                    "labels_per_client": labels_per_client,
+                                    "selector": selector, "noise_pct": noise,
+                                    "seed": seed, "dataset": dataset,
+                                    "availability_model": availability_model,
+                                    "ablation": ablation, "return_code": 0,
+                                    "completed_rounds": 0,
+                                    "expected_rounds": rounds_per_run,
+                                    "awpsp_accuracy_last": None,
+                                    "stdout_tail": "", "stderr_tail": "",
+                                    "metrics_path": "", "final_metrics_path": "",
+                                }
+                                rows.append(live_row)
+                                last_persisted_round = -1
+
+                                def persist_round(metrics_file, final_file):
+                                    nonlocal last_persisted_round
+                                    completed = completed_metric_rounds(metrics_file)
+                                    if completed == 0 or completed == last_persisted_round:
+                                        return
+                                    # main_server writes the round trace before its
+                                    # final-metric row. Wait until both files expose
+                                    # the round so benchmark_results.csv is complete.
+                                    if not final_file.exists():
+                                        return
+                                    with final_file.open(newline="") as handle:
+                                        final_rows = list(csv.DictReader(handle))
+                                    if not final_rows or int(final_rows[-1].get("Round", 0)) < completed:
+                                        return
+                                    last_persisted_round = completed
+                                    live_row.update({
+                                        "completed_rounds": completed,
+                                        "awpsp_accuracy_last": last_awpsp_accuracy(metrics_file),
+                                        "metrics_path": str(metrics_file),
+                                        "final_metrics_path": str(final_file),
+                                    })
+                                    write_experiment_results(rows, result_fields)
+                                    write_results_summary(rows)
+                                    benchmark_rows = write_benchmark_results(
+                                        rows, include_in_progress=True)
+                                    if live_graphs and benchmark_rows:
+                                        create_graphs(BENCHMARK_RESULTS, GRAPH_DIR)
+                                    print(
+                                        f"[suite] persisted live artifacts after round "
+                                        f"{completed}/{rounds_per_run} for {run_tag}",
+                                        flush=True,
+                                    )
+
                                 # run_case() returns exactly these six values.
+
                                 code, acc, out_tail, err_tail, metrics_path, final_path = run_case(
                                     {
                                         "LOGICAL_CLIENT_COUNT": n,
                                         "LOGICAL_SELECTED_PER_ROUND": m,
                                         "LOGICAL_LABELS_PER_CLIENT": labels_per_client,
-                                        "PHYSICAL_CONTAINER_LIMIT": 3,
+                                        "PHYSICAL_CONTAINER_LIMIT": 10,
                                         "LOGICAL_SPLIT_MODE": split,
-                                        "SELECTOR_MODE": selector,
+                                        "EXPERIMENT_METHOD": selector,
+                                        "SELECTION_MODE": os.getenv("SELECTION_MODE", "cup"),
                                         "CORRELATION_NOISE_PCT": noise,
                                         "EXPERIMENT_SEED": seed,
-                                        "NUM_ROUNDS": 50,
+                                        "DATASET": dataset,
+                                        "AVAILABILITY_MODEL": availability_model,
+                                        "ABLATION": ablation,
+                                        "NUM_ROUNDS": rounds_per_run,
                                         "USE_LOGICAL_SCHEDULING": True,
                                     },
                                     run_tag,
+                                    progress_callback=persist_round,
                                 )
                                 done += 1
-                                print(f"[suite] {done}/{total} N={n} m={m} split={split} labels={labels_per_client} selector={selector} noise={noise} seed={seed} rc={code} acc={acc}", flush=True)
-                                row = {
-                                    "N": n,
-                                    "m": m,
-                                    "split_mode": split,
-                                    "labels_per_client": labels_per_client,
-                                    "selector": selector,
-                                    "noise_pct": noise,
-                                    "seed": seed,
+
+                                completed_rounds = completed_metric_rounds(metrics_path)
+                                print(f"[suite] child_run={done}/{total_runs} completed_rounds={completed_rounds}/{rounds_per_run} N={n} m={m} split={split} labels={labels_per_client} selector={selector} noise={noise} seed={seed} rc={code} acc={acc}", flush=True)
+                                live_row.update({
                                     "return_code": code,
+                                    "completed_rounds": completed_rounds,
                                     "awpsp_accuracy_last": acc,
                                     "stdout_tail": out_tail.replace("\n", "\\n"),
                                     "stderr_tail": err_tail.replace("\n", "\\n"),
                                     "metrics_path": metrics_path,
                                     "final_metrics_path": final_path,
-                                }
-                                rows.append(row)
-                                with OUT.open("a", newline="") as f:
-                                    writer = csv.DictWriter(f, fieldnames=result_fields)
-                                    writer.writerow(row)
+                                })
+                                write_experiment_results(rows, result_fields)
+                                write_results_summary(rows)
+                                write_benchmark_results(
+                                    rows, include_in_progress=True)
 
-    grouped = {}
-    for r in rows:
-        key = (r["N"], r["m"], r["split_mode"], r["labels_per_client"], r["selector"], r["noise_pct"])
-        grouped.setdefault(key, []).append(r["awpsp_accuracy_last"])
+    benchmark_rows = write_benchmark_results(rows)
+    print(
+        f"[suite] wrote {len(benchmark_rows)} graph-ready rows to {BENCHMARK_RESULTS}",
+        flush=True,
+    )
 
-    with SUMMARY.open("w", newline="") as f:
-        fieldnames = ["N", "m", "split_mode", "labels_per_client", "selector", "noise_pct",
-                      "mean", "standard_deviation", "ci95_low", "ci95_high"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for (n, m, split, labels_per_client, selector, noise), vals in grouped.items():
-            clean = [v for v in vals if isinstance(v, (float, int))]
-            mean, ci = confidence_interval(clean)
-            std = statistics.stdev(clean) if len(clean) > 1 else 0.0
-            writer.writerow(
-                {
-                    "N": n,
-                    "m": m,
-                    "split_mode": split,
-                    "labels_per_client": labels_per_client,
-                    "selector": selector,
-                    "noise_pct": noise,
-                    "mean": mean,
-                    "standard_deviation": std,
-                    "ci95_low": mean - ci,
-                    "ci95_high": mean + ci,
-                }
-            )
+
+    write_experiment_results(rows, result_fields)
+    write_results_summary(rows)
+
 
 def sweep_configurations():
     """Yield the two paper hyperparameter sweeps for experiment launchers."""
@@ -231,15 +426,18 @@ def create_graphs(results_path=BENCHMARK_RESULTS, output_dir=GRAPH_DIR):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run FL experiments and/or graph completed results")
-    parser.add_argument("action", choices=("run", "graphs", "all"), nargs="?", default="run")
+    parser.add_argument("action", choices=("run", "graphs", "all"), nargs="?", default="all")
     parser.add_argument("--results", type=Path, default=BENCHMARK_RESULTS)
     parser.add_argument("--graph-dir", type=Path, default=GRAPH_DIR)
     args = parser.parse_args(argv)
     if args.action in {"run", "all"}:
-        run_suite()
+        run_suite(live_graphs=args.action == "all")
         print(f"[suite] wrote {OUT} and {SUMMARY} (per-run logs under {RUN_DIR})", flush=True)
     if args.action in {"graphs", "all"}:
         create_graphs(args.results, args.graph_dir)
+
+
+
 
 
 if __name__ == "__main__":

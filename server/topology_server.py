@@ -492,7 +492,7 @@ class TopologyProvider:
             if node in self.last_model_states:
                past_model_state, last_seen = self.last_model_states[node]
                delta = current_round - last_seen
-               eta_k = surrogate_weight(eta_0, lambda_decay, delta)
+               eta_k = surrogate_weight(eta_0, self.lambda_decay, delta)
 
                # Load old model to surrogate
                surrogate_model = models.resnet18(weights=None)
