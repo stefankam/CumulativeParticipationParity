@@ -9,6 +9,7 @@ import time
 import copy
 import math
 from typing import Dict, Tuple
+from pathlib import Path
 from torchvision import models
 from shared_state import topology
 import threading
@@ -20,6 +21,10 @@ from availability import extract_availability_vectors
 import numpy as np
 import json
 from collections import defaultdict
+from baselines import ALL_BASELINES, BaselineClient, BaselineState, select_clients
+from fairness import FairnessSchedulerController, fairness_metrics
+from experiment_config import build_logical_label_map
+
 
 
 def read_proc_stat() -> Tuple[int, int]:
@@ -232,371 +237,140 @@ def init_resnet(train_last_n_blocks=1):
 
 
 def run_federated_training():
+    """Run one explicitly selected policy; comparisons belong to benchmark_suite."""
     global current_round
+    if shared_state.topology is None:
+        raise RuntimeError("Topology has not been initialized")
 
     seed = int(os.getenv("EXPERIMENT_SEED", "42"))
     np.random.seed(seed)
     torch.manual_seed(seed)
-    logical_client_count = int(os.getenv("LOGICAL_CLIENT_COUNT", "100"))
-    physical_container_limit = int(os.getenv("PHYSICAL_CONTAINER_LIMIT", "10"))
-    logical_selected_per_round = int(os.getenv("LOGICAL_SELECTED_PER_ROUND", "10"))
-    use_logical_scheduling = os.getenv(
+
+
+
+
+    logical_count = int(os.getenv("LOGICAL_CLIENT_COUNT", 100))
+    selected_per_round = int(os.getenv("LOGICAL_SELECTED_PER_ROUND", 10))
+    physical_limit = int(os.getenv("PHYSICAL_CONTAINER_LIMIT", 10))
+    use_logical = os.getenv(
         "USE_LOGICAL_SCHEDULING", "true").lower() in ("1", "true", "yes", "on")
-    logical_labels_per_client = int(os.getenv("LOGICAL_LABELS_PER_CLIENT", "2"))
-    split_mode = os.getenv("LOGICAL_SPLIT_MODE", "extreme")
-    dirichlet_alpha = float(os.getenv("DIRICHLET_ALPHA", "0.5"))
-    selector_mode = os.getenv("SELECTOR_MODE", "awpsp").lower()
-    corr_noise_pct = float(os.getenv("CORRELATION_NOISE_PCT", "0.0"))
+    labels_per_client = int(os.getenv("LOGICAL_LABELS_PER_CLIENT", 2))
+    split_mode = os.getenv("LOGICAL_SPLIT_MODE", "overlap")
+    selector = os.getenv("SELECTOR_MODE", "select_fair_nodes").lower()
+    if selector != "select_fair_nodes" and selector not in ALL_BASELINES:
+        raise ValueError(f"Unknown SELECTOR_MODE={selector!r}")
 
-    experiment_context = {
-        "logical_population": logical_client_count,
-        "selected_per_round": logical_selected_per_round,
-        "physical_clients": physical_container_limit,
-        "split_mode": split_mode,
-        "dirichlet_alpha": dirichlet_alpha,
-        "selector_mode": selector_mode,
-        "correlation_noise_pct": corr_noise_pct,
-        "seed": seed,
-    }
-    print(
-        "🧪 Active experiment context: "
-        + json.dumps(experiment_context, sort_keys=True),
-        flush=True,
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    model.fc = torch.nn.Linear(model.fc.in_features, 10)
+    weights = copy.deepcopy(model.state_dict())
+    logical_labels = build_logical_label_map(
+        logical_count, labels_per_client, split_mode=split_mode,
+        dirichlet_alpha=float(os.getenv("DIRICHLET_ALPHA", 0.5)), seed=seed,
     )
-    
-    metrics_log_path = os.getenv("METRICS_LOG_PATH", "metrics_log.csv")
-    final_metrics_path = os.getenv("FINAL_METRICS_PATH", "final_metrics.csv")
-    logical_participation_awpsp = defaultdict(int)
-    logical_participation_psp = defaultdict(int)
-    logical_participation_oort = defaultdict(int)
-    logical_participation_log = defaultdict(int)
-    # Oort-style selector state (utility/reward + exploration + duration penalty).
-    oort_pull_count = defaultdict(int)
-    oort_utility_ema = defaultdict(float)
-    oort_duration_ema = defaultdict(lambda: 1.0)
-    logical_loss_history_awpsp = defaultdict(list)
-    logical_loss_history_psp = defaultdict(list)
-    logical_loss_history_oort = defaultdict(list)
+
+    client_ids = [f"h{i}" for i in range(logical_count)]
+    selection_counts = defaultdict(int)
+    availability_seen = defaultdict(int)
+    utility_sums = defaultdict(float)
+    utility_observations = defaultdict(int)
+    baseline_state = BaselineState()
+    fairness_controller = FairnessSchedulerController(client_ids, mode="cup", seed=seed)
+    metrics_path = os.getenv("METRICS_LOG_PATH", "metrics_log.csv")
+    Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(metrics_path, "w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=[
+            "round", "method", "accuracy", "participation_gini",
+            "participation_variance", "selected_clients",
+        ])
+        writer.writeheader()
+        for current_round in range(int(os.getenv("NUM_ROUNDS", 50))):
+            physical_ids = list(device_registry)[:physical_limit]
+            if use_logical:
+                clients = []
+                for client_id in client_ids:
+                    # Logical clients are mapped onto currently live physical workers.
+                    available = 1.0 if physical_ids else 0.0
+                    availability_seen[client_id] += int(available > 0)
+                    estimate = availability_seen[client_id] / (current_round + 1)
+                    clients.append(BaselineClient(
+                        client_id, available, estimate,
+                        selection_counts[client_id], tuple(logical_labels.get(client_id, ())),
+                    ))
+                if selector == "select_fair_nodes":
+                    telemetry = {client.client_id: bool(client.availability) for client in clients}
+                    fairness_controller.observe_telemetry(telemetry)
+                    selected = fairness_controller.select(
+                        telemetry=telemetry,
+                        capacity=selected_per_round,
+                        mu_hat={
+                            client_id: utility_sums[client_id] / utility_observations[client_id]
+                            if utility_observations[client_id] else 1.0
+                            for client_id in client_ids
+                        },
+                    )
+                else:
+                    selected = select_clients(selector, clients, selected_per_round, baseline_state, rng=rng)
+                updated = shared_state.topology.run_logical_federated_round(selected, physical_ids, weights)
+            else:
+
+                failures = shared_state.topology.get_correlated_failure(
+                    current_round, extract_availability_vectors("traces/traces.txt"),
+                    corr_threshold=0.35, num_neighbors=4,
+                )
 
 
-    label_map = shared_state.topology.label_map
+                if selector == "select_fair_nodes":
+                    selected, _, _ = shared_state.topology.select_fair_nodes(
+                        model, current_round, failures, shared_state.topology.label_map,
+                        selected_per_round,
+                    )
+                else:
 
-    # Load availability vectors
-    availability_vectors = extract_availability_vectors("traces/traces.txt")
+                    failed = {node for pair in failures for node in pair}
+                    clients = [BaselineClient(
+                        node,
+                        0.0 if node in failed else float(meta.get("availability") or 0.0),
+                        float(meta.get("availability") or 0.0),
+                        selection_counts[node],
+                        tuple(shared_state.topology.label_map.get(node, ())),
+                    ) for node, meta in shared_state.topology.dht.table.items()]
+                    selected = select_clients(selector, clients, selected_per_round, baseline_state, rng=rng)
+                updated = shared_state.topology.run_federated_round(selected, weights, model)
 
-    awpsp_accuracy_log = []
-    psp_accuracy_log = [] 
-    awpsp_instant_fairness_log = []
-    psp_instant_fairness_log = []
-    awpsp_cumul_fairness_log = []
-    psp_cumul_fairness_log = []  
-    corr_failure_log = []
-    awpsp_covered_labels_log = []
-    psp_covered_labels_log = []
-    selected_awpsp_log = []
-    selected_psp_log = []
-    awpsp_avg_score_log = []
-    psp_avg_score_log = []
-    awpsp_labels_log =[]
-    psp_labels_log =[]
-    awpsp_KL_log =[]
-    psp_KL_log =[]
-    awpsp_unseen_log =[]
-    psp_unseen_log =[]
-    awpsp_gini_log =[]
-    psp_gini_log =[]
-    accuracy_log = []
-    var_u_log = []
-    surrogate_log = []
-
-    # ---------------- Initialize models ----------------
-#    base_model = models.resnet18(weights=None)
-    base_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    base_model.fc = torch.nn.Linear(base_model.fc.in_features, 10)
-#    base_model = init_resnet(train_last_n_blocks=2)  # train layer3 + layer4 + fc
-
-    # Two independent weight states
-    current_weights_awpsp = base_model.state_dict()
-    current_weights_psp = copy.deepcopy(current_weights_awpsp)
+            if updated is not None:
+                weights = updated
+                model.load_state_dict(weights)
+                accuracy = shared_state.topology.evaluate_global_model(
+                    model, selected_nodes=selected, use_selected_nodes=False,
+                    physical_ids=physical_ids if use_logical else None,
+                )
 
 
-    def compute_final_metrics(context, model=None, round_index=None):
-        if model is None:
-            model = base_model
-        if round_index is None:
-            round_index = current_round
-        nodes = list(shared_state.topology.dht.table.keys())
-        per_client_acc = shared_state.topology.evaluate_per_client_accuracy(model, nodes)
-        acc_values = [val for val in per_client_acc.values() if val is not None]
-        if not acc_values:
-            return None
-
-        avg_acc = sum(acc_values) / len(acc_values)
-        global_accuracy = shared_state.topology.evaluate_global_model(
-            model, selected_nodes=None, use_selected_nodes=False)
-        acc_variance = sum((val - avg_acc) ** 2 for val in acc_values) / len(acc_values)
-        acc_squared_sum = sum(val ** 2 for val in acc_values)
-        jain_acc = (sum(acc_values) ** 2) / (len(acc_values) * acc_squared_sum) if acc_squared_sum else 0.0
-
-        u_tilde_values = []
-        u_tilde_with_surrogate = []
-        for node in nodes:
-            if shared_state.topology.total_rounds_elapsed > 0:
-                pi_k = shared_state.topology.availability_estimator.estimate(node)
-                if pi_k > 0:
-                    u_k = shared_state.topology.utility_log[node]
-                    u_tilde_values.append(u_k / pi_k)
-                    surrogate_k = shared_state.topology.surrogate_contributions.get(node, 0.0)
-                    u_tilde_with_surrogate.append((u_k + surrogate_k) / pi_k)
-
-        def compute_utility_metrics(values):
-            if not values:
-                return None, None
-            mean_u = sum(values) / len(values)
-            std_u = math.sqrt(sum((val - mean_u) ** 2 for val in values) / len(values))
-            utility_cv = (std_u / mean_u) if mean_u != 0 else 0.0
-            squared_sum = sum(val ** 2 for val in values)
-            jain_utility = (sum(values) ** 2) / (len(values) * squared_sum) if squared_sum else 0.0
-            return utility_cv, jain_utility
-
-        selected_counts = [len(shared_state.topology.participation_log.get(node, [])) for node in nodes]
-        sel_gap = max(selected_counts) - min(selected_counts) if selected_counts else 0.0
-        if selected_counts and sum(selected_counts) > 0:
-            diffs = 0.0
-            for i in selected_counts:
-                for j in selected_counts:
-                    diffs += abs(i - j)
-            gini = diffs / (2 * len(selected_counts) * sum(selected_counts))
-        else:
-            gini = 0.0
-
-        utility_cv_no, jain_utility_no = compute_utility_metrics(u_tilde_values)
-        utility_cv_with, jain_utility_with = compute_utility_metrics(u_tilde_with_surrogate)
-
-        return {
-            "Round": round_index + 1,
-            "logical_population": context["logical_population"],
-            "selected_per_round": context["selected_per_round"],
-            "physical_clients": context["physical_clients"],
-            "split_mode": context["split_mode"],
-            "dirichlet_alpha": context["dirichlet_alpha"],
-            "selector_mode": context["selector_mode"],
-            "correlation_noise_pct": context["correlation_noise_pct"],
-            "seed": context["seed"],
-            "global_accuracy": global_accuracy,
-            "mean_client_accuracy": avg_acc,
-            "global_accuracy": global_accuracy,
-            "mean_client_accuracy": avg_acc,
-            "Avg Acc (No Surrogate)": avg_acc,
-            "Jain (Acc) (No Surrogate)": jain_acc,
-            "Utility CV (No Surrogate)": utility_cv_no,
-            "Jain (Utility) (No Surrogate)": jain_utility_no,
-            "Sel. Gap (No Surrogate)": sel_gap,
-            "Gini (No Surrogate)": gini,
-            "Avg Acc (With Surrogate)": avg_acc,
-            "Jain (Acc) (With Surrogate)": jain_acc,
-            "Utility CV (With Surrogate)": utility_cv_with,
-            "Jain (Utility) (With Surrogate)": jain_utility_with,
-            "Sel. Gap (With Surrogate)": sel_gap,
-            "Gini (With Surrogate)": gini,
-            "Acc Variance": acc_variance,
-        }
-
-    num_rounds = 50
-
-    for current_round in range(num_rounds):
-        print(f"\n🌐 Federated Round {current_round + 1}")
-
-        round_start = time.perf_counter()
-        sys_start = snapshot_system()
-
-        # Detect correlated failures
-        correlated_failures = shared_state.topology.get_correlated_failure(
-            current_round, availability_vectors, corr_threshold=0.35, num_neighbors=4
-        )
-        num_corr_failed = sum(1 for _, failed_neighbors in correlated_failures if failed_neighbors)
-        corr_failure_log.append((current_round, num_corr_failed))
-        print(f"🌩️ Correlated failure count: {num_corr_failed}")
-        selected, var_u, total_bias_bound = shared_state.topology.select_fair_nodes(
-            base_model,
-            current_round,
-            correlated_failures,
-            num_clients=5,
-            corr_threshold=0.35,
-            label_map=label_map,
-            lambda_=float(os.getenv("LAMBDA_DECAY", "0.10")),
-            epsilon=1e-5,
-        )
-        selection_end = time.perf_counter()
-        weights_fair = shared_state.topology.run_federated_round(selected, current_weights_awpsp, base_model)
-        if weights_fair is not None:
-           base_model.load_state_dict(weights_fair)
-           current_weights_awpsp = weights_fair
-           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=False)
-           accuracy_log.append((current_round, accuracy))
-           var_u_log.append((current_round, var_u))
-           surrogate_log.append((current_round, total_bias_bound))
-           print(f"🔁 Round {current_round + 1}: Fair-Select Acc = {accuracy:.2f}%")
-        else:
-           print("⚠️ No updates received from clients. Skipping model update this round.")
-        fair_end = time.perf_counter()
-
-        # ---------------- AW-PSP branch ----------------
-        # Node selection based on AW-PSP
-
-#        awpsp_model = models.resnet18(weights=None)
-        awpsp_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        awpsp_model.fc = torch.nn.Linear(awpsp_model.fc.in_features, 10)
-        awpsp_model.load_state_dict(current_weights_awpsp)
-
-        selected_awpsp, awpsp_instant_var, awpsp_cumul_var, awpsp_covered_labels, awpsp_avg_score, awpsp_labels, awpsp_KL, awpsp_unseen, awpsp_gini = \
-            shared_state.topology.prioritize_available_nodes(
-                awpsp_model, current_round, correlated_failures, num_clients=5, label_map=label_map
-            )
-        awpsp_covered_labels_log.append((current_round, len(awpsp_covered_labels)))
-        selected_awpsp_log.append((current_round, selected_awpsp))
-
-        weights_awpsp = shared_state.topology.run_federated_round(selected_awpsp, current_weights_awpsp, awpsp_model)
-        if weights_awpsp is not None:
-           current_weights_awpsp = weights_awpsp
-           awpsp_model.load_state_dict(current_weights_awpsp)
-           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, selected_nodes=selected_awpsp, use_selected_nodes=False)
-           awpsp_accuracy_log.append((current_round, accuracy_awpsp))
-           awpsp_instant_fairness_log.append((current_round, awpsp_instant_var))
-           awpsp_cumul_fairness_log.append((current_round, awpsp_cumul_var))
-           print(f"🔁 Round {current_round + 1}: AW-PSP Acc = {accuracy_awpsp:.2f}%")
-           awpsp_avg_score_log.append((current_round, awpsp_avg_score))
-           awpsp_labels_log.append((current_round, awpsp_labels))
-           awpsp_KL_log.append((current_round, awpsp_KL))
-           awpsp_unseen_log.append((current_round, awpsp_unseen))
-           awpsp_gini_log.append((current_round, awpsp_gini))
-        else:
-           print("⚠️ No updates received from clients. Skipping model update this round.")
-        awpsp_end = time.perf_counter()
-
-        # ---------------- PSP branch ----------------
-        # Use a fresh model copy so AW-PSP doesn’t pollute PSP results
-        #psp_model = models.resnet18(weights=None)
-        psp_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        psp_model.fc = torch.nn.Linear(psp_model.fc.in_features, 10)
-        psp_model.load_state_dict(current_weights_psp)
-
-        selected_psp, psp_instant_var, psp_cumul_var, psp_covered_labels, psp_avg_score, psp_labels, psp_KL, psp_unseen, psp_gini = \
-            shared_state.topology.psp_random_selection(
-                psp_model, correlated_failures, num_clients=5, label_map=label_map
-            )
-        psp_covered_labels_log.append((current_round, len(psp_covered_labels)))
-        selected_psp_log.append((current_round, selected_psp))
-
-        weights_psp = shared_state.topology.run_federated_round(selected_psp, current_weights_psp,psp_model)
-        if weights_psp is not None:
-           current_weights_psp = weights_psp
-           psp_model.load_state_dict(current_weights_psp)
-           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, selected_nodes=selected_psp, use_selected_nodes=False)
-           psp_accuracy_log.append((current_round, accuracy_psp))
-           psp_instant_fairness_log.append((current_round, psp_instant_var))
-           psp_cumul_fairness_log.append((current_round, psp_cumul_var))
-           print(f"🔁 Round {current_round + 1}: PSP Acc = {accuracy_psp:.2f}%")
-           psp_avg_score_log.append((current_round, psp_avg_score))
-           psp_labels_log.append((current_round, psp_labels))
-           psp_KL_log.append((current_round, psp_KL))
-           psp_unseen_log.append((current_round, psp_unseen))
-           psp_gini_log.append((current_round, psp_gini))
-        else:
-           print("⚠️ No updates received from clients. Skipping model update this round.")
-
-        psp_end = time.perf_counter()
+            else:
+                accuracy = None
+            for client_id in selected:
+                selection_counts[client_id] += 1
+                if accuracy is not None:
+                    utility_sums[client_id] += max(float(accuracy), 1e-12)
+                    utility_observations[client_id] += 1
+                    shared_state.topology.utility_log[client_id] += max(float(accuracy), 1e-12)
+            counts = [selection_counts[client_id] for client_id in client_ids]
+            mean = sum(counts) / len(counts) if counts else 0.0
+            variance = sum((value - mean) ** 2 for value in counts) / len(counts) if counts else 0.0
+            normalized = {client_id: float(selection_counts[client_id]) for client_id in client_ids}
+            round_fairness = fairness_metrics(normalized, selection_counts)
+            writer.writerow({
+                "round": current_round, "method": selector, "accuracy": accuracy,
+                "participation_gini": round_fairness["gini_coefficient"],
+                "participation_variance": variance, "selected_clients": selected,
+            })
+            output.flush()
+            print(f"Round {current_round + 1}: {selector} accuracy={accuracy} selected={selected}")
 
 
-        with open("metrics_log.csv", "w") as f:
-            writer = csv.writer(f)
-            if current_round == 0:
-                writer.writerow([
-                    "Round", "logical_population", "selected_per_round",
-                    "physical_clients", "split_mode", "dirichlet_alpha",
-                    "selector_mode", "correlation_noise_pct", "seed",
-                    "Select_Fair_Accuracy", "Select_Fair_variance",
-                    "Select_Fair_Surrogate", "AWPSP_Accuracy",
-                    "AWPSP_instant_fairness", "AWPSP_cumul_fairness",
-                    "CorrelatedFailureCount", "AWPSP_CoveredLabelsCount",
-                    "PSP_Accuracy", "PSP_instant_fairness", "PSP_cumul_fairness",
-                    "PSP_CoveredLAbelsCount", "selected_awpsp", "selected_psp",
-                    "AWPSP Avg Score", "PSP Avg Score", "AWPSP labels",
-                    "PSP labels", "AWPSP KL", "PSP KL", "AWPSP unseen",
-                    "PSP unseen", "AWPSP gini", "PSP gini",
-                ])
 
-            i = current_round
-            metrics_values = [
-                i,
-                experiment_context["logical_population"],
-                experiment_context["selected_per_round"],
-                experiment_context["physical_clients"],
-                experiment_context["split_mode"],
-                experiment_context["dirichlet_alpha"],
-                experiment_context["selector_mode"],
-                experiment_context["correlation_noise_pct"],
-                experiment_context["seed"],
-
-                accuracy_log[i][1] if i < len(accuracy_log) else None,
-                var_u_log[i][1] if i < len(var_u_log) else None,
-                surrogate_log[i][1] if i < len(surrogate_log) else None,
-                awpsp_accuracy_log[i][1] if i < len(awpsp_accuracy_log) else None,
-                awpsp_instant_fairness_log[i][1] if i < len(awpsp_instant_fairness_log) else None,
-                awpsp_cumul_fairness_log[i][1] if i < len(awpsp_cumul_fairness_log) else None,
-                corr_failure_log[i][1] if i < len(corr_failure_log) else None,
-                awpsp_covered_labels_log[i][1] if i < len(awpsp_covered_labels_log) else None,
-                psp_accuracy_log[i][1] if i < len(psp_accuracy_log) else None,
-                psp_instant_fairness_log[i][1] if i < len(psp_instant_fairness_log) else None,
-                psp_cumul_fairness_log[i][1] if i < len(psp_cumul_fairness_log) else None,
-                psp_covered_labels_log[i][1] if i < len(psp_covered_labels_log) else None,
-                selected_awpsp_log[i][1] if i < len(selected_awpsp_log) else None,
-                selected_psp_log[i][1] if i < len(selected_psp_log) else None,
-                awpsp_avg_score_log[i][1] if i < len(awpsp_avg_score_log) else None,
-                psp_avg_score_log[i][1] if i < len(psp_avg_score_log) else None,
-                awpsp_labels_log[i][1] if i < len(awpsp_labels_log) else None,
-                psp_labels_log[i][1] if i < len(psp_labels_log) else None,
-                awpsp_KL_log[i][1] if i < len(awpsp_KL_log) else None,
-                psp_KL_log[i][1] if i < len(psp_KL_log) else None,
-                awpsp_unseen_log[i][1] if i < len(awpsp_unseen_log) else None,
-                psp_unseen_log[i][1] if i < len(psp_unseen_log) else None,
-                awpsp_gini_log[i][1] if i < len(awpsp_gini_log) else None,
-                psp_gini_log[i][1] if i < len(psp_gini_log) else None,
-            ]
-            print(*metrics_values)
-            writer.writerow(metrics_values)
-
-
-        summary = compute_final_metrics(experiment_context, base_model, current_round)
-        if summary:
-            print("Final metrics summary:")
-            for key, value in summary.items():
-                print(f"{key}: {value}")
-            write_header = not os.path.exists("final_metrics.csv")
-            with open("final_metrics.csv", "a") as f:
-                writer = csv.writer(f)
-                if write_header:
-                    writer.writerow(list(summary.keys()))
-                writer.writerow(list(summary.values()))
-
-        sys_end = snapshot_system()
-        cpu_pct, mem_used_kb, disk_delta = summarize_system(sys_start, sys_end)
-        print(
-            "📊 Round timing: selection={:.2f}s fair={:.2f}s awpsp={:.2f}s psp={:.2f}s total={:.2f}s".format(
-                selection_end - round_start,
-                fair_end - selection_end,
-                awpsp_end - fair_end,
-                psp_end - awpsp_end,
-                psp_end - round_start,
-            )
-        )
-        print(
-            "🧮 System usage: CPU~{:.1f}% MemUsed~{:.1f}MB DiskDelta~{}"
-            .format(cpu_pct, mem_used_kb / 1024.0, disk_delta)
-        )
-
-
-def wait_for_latency_data(num_clients=3):
+def wait_for_latency_data(num_clients=2):
     print("⏳ Waiting for latency updates from clients...")
     while True:
         ready = 0
@@ -610,6 +384,7 @@ def wait_for_latency_data(num_clients=3):
 
     print("🚀 Sufficient clients reported latency. Starting training.")
     run_federated_training()
+
 
 
 

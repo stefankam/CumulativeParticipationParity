@@ -39,7 +39,9 @@ COPY shared_state.py .
 COPY availability.py .
 COPY experiment_suite.py .
 COPY benchmark_suite.py .
+COPY baselines.py .
 COPY fairness.py .
+COPY experiment_config.py .
 COPY data/ data/
 
 # --------------------------

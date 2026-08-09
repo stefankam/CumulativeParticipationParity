@@ -4,7 +4,7 @@ Runs matrix over:
 - logical population N in {100,300,1000,3000}
 - selected clients m in {10,20,50,100}
 - split mode in {overlap, dirichlet}
-- selectors in {awpsp, random, availability_only, oort}
+- one method selected through SELECTOR_MODE (CPP or a registered baseline)
 - seeds (default 5)
 - correlation noise in {0,10,20,40}
 
@@ -67,7 +67,7 @@ def confidence_interval(values):
     return mean, half
 
 
-def last_awpsp_accuracy(metrics_path):
+def last_accuracy(metrics_path):
     metrics_path = Path(metrics_path)
     if not metrics_path.exists():
         return None
@@ -75,12 +75,12 @@ def last_awpsp_accuracy(metrics_path):
         rows = list(csv.DictReader(f))
     if not rows:
         return None
-    val = rows[-1].get("AWPSP_Accuracy")
+    val = rows[-1].get("accuracy")
     return float(val) if val not in (None, "") else None
     # A round can legitimately have no update.  Use the most recent completed
     # AW-PSP measurement rather than assuming the last CSV row is populated.
     for row in reversed(rows):
-        val = row.get("AWPSP_Accuracy")
+        val = row.get("accuracy")
         if val not in (None, ""):
             try:
                 return float(val)
@@ -165,7 +165,7 @@ def write_results_summary(rows, destination=SUMMARY):
     for row in rows:
         key = (row["N"], row["m"], row["split_mode"],
                row["labels_per_client"], row["selector"], row["noise_pct"])
-        grouped.setdefault(key, []).append(row["awpsp_accuracy_last"])
+        grouped.setdefault(key, []).append(row["accuracy_last"])
 
     fieldnames = ["N", "m", "split_mode", "labels_per_client", "selector",
                   "noise_pct", "mean", "standard_deviation", "ci95_low",
@@ -233,7 +233,7 @@ def run_case(env_overrides, run_tag, progress_callback=None):
 
     process.wait()
     merged_tail = ''.join(tail)
-    acc = last_awpsp_accuracy(metrics_path)
+    acc = last_accuracy(metrics_path)
     return_code = process.returncode
     expected_rounds = int(env_overrides.get("NUM_ROUNDS", 50))
     completed_rounds = completed_metric_rounds(metrics_path)
@@ -247,7 +247,7 @@ def run_case(env_overrides, run_tag, progress_callback=None):
     elif return_code == 0 and acc is None:
         return_code = 2
         diagnostic_tail.append(
-            "[suite] ERROR: process exited successfully but produced no AWPSP_Accuracy; "
+            "[suite] ERROR: process exited successfully but produced no Accuracy; "
             f"inspect {log_path}\n")
     reported_tail = ''.join(diagnostic_tail) or merged_tail[-4000:]
     reported_tail = f"[full_log={log_path}]\n{reported_tail}"
@@ -264,7 +264,7 @@ def run_suite(live_graphs=False):
     selections = [10]
     split_modes = ["overlap"]
     labels_per_client_options = [2]
-    selectors = ["awpsp"]
+    selectors = [item for item in os.getenv("EXPERIMENT_METHODS", "select_fair_nodes").split(",") if item]
     noises = [0]
     seeds = [0, 1, 2, 3, 4]
     rounds_per_run = int(os.getenv("NUM_ROUNDS", "50"))
@@ -277,7 +277,7 @@ def run_suite(live_graphs=False):
     result_fields = [
         "N", "m", "split_mode", "labels_per_client", "selector", "noise_pct", "seed",
         "dataset", "availability_model", "ablation",
-        "return_code", "completed_rounds", "expected_rounds", "awpsp_accuracy_last", "stdout_tail", "stderr_tail",
+        "return_code", "completed_rounds", "expected_rounds", "accuracy_last", "stdout_tail", "stderr_tail",
         "metrics_path", "final_metrics_path"
     ]
     # Create every public artifact before the first child starts. They are then
@@ -316,7 +316,7 @@ def run_suite(live_graphs=False):
                                     "ablation": ablation, "return_code": 0,
                                     "completed_rounds": 0,
                                     "expected_rounds": rounds_per_run,
-                                    "awpsp_accuracy_last": None,
+                                    "accuracy_last": None,
                                     "stdout_tail": "", "stderr_tail": "",
                                     "metrics_path": "", "final_metrics_path": "",
                                 }
@@ -340,7 +340,7 @@ def run_suite(live_graphs=False):
                                     last_persisted_round = completed
                                     live_row.update({
                                         "completed_rounds": completed,
-                                        "awpsp_accuracy_last": last_awpsp_accuracy(metrics_file),
+                                        "accuracy_last": last_accuracy(metrics_file),
                                         "metrics_path": str(metrics_file),
                                         "final_metrics_path": str(final_file),
                                     })
@@ -385,7 +385,7 @@ def run_suite(live_graphs=False):
                                 live_row.update({
                                     "return_code": code,
                                     "completed_rounds": completed_rounds,
-                                    "awpsp_accuracy_last": acc,
+                                    "accuracy_last": acc,
                                     "stdout_tail": out_tail.replace("\n", "\\n"),
                                     "stderr_tail": err_tail.replace("\n", "\\n"),
                                     "metrics_path": metrics_path,
