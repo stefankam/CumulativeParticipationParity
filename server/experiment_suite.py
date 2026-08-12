@@ -75,8 +75,6 @@ def last_accuracy(metrics_path):
         rows = list(csv.DictReader(f))
     if not rows:
         return None
-    val = rows[-1].get("accuracy")
-    return float(val) if val not in (None, "") else None
     # A round can legitimately have no update.  Use the most recent completed
     # AW-PSP measurement rather than assuming the last CSV row is populated.
     for row in reversed(rows):
@@ -95,11 +93,11 @@ def completed_metric_rounds(metrics_path):
     if not metrics_path.exists():
         return 0
     with metrics_path.open() as handle:
-        rounds = {
-            row.get("Round")
-            for row in csv.DictReader(handle)
-            if row.get("Round") not in (None, "")
-        }
+        rounds = set()
+        for row in csv.DictReader(handle):
+            value = row.get("round", row.get("Round"))
+            if value not in (None, ""):
+                rounds.add(value)
     return len(rounds)
 
 
@@ -195,7 +193,7 @@ def run_case(env_overrides, run_tag, progress_callback=None):
 
     print(f"[suite] launching: {' '.join(cmd)}", flush=True)
     env["METRICS_LOG_PATH"] = str(metrics_path)
-    env["FINAL_METRICS_PATH"] = str(final_path)
+    env["SELECTOR_MODE"] = str(env_overrides.get("EXPERIMENT_METHOD", "select_fair_nodes"))
     env["REUSE_REGISTERED_CLIENTS"] = os.getenv("REUSE_REGISTERED_CLIENTS", "1")
     print(f"[suite] env: {env_overrides}", flush=True)
     print(f"[suite] metrics: {metrics_path}", flush=True)
@@ -363,7 +361,8 @@ def run_suite(live_graphs=False):
                                         "LOGICAL_CLIENT_COUNT": n,
                                         "LOGICAL_SELECTED_PER_ROUND": m,
                                         "LOGICAL_LABELS_PER_CLIENT": labels_per_client,
-                                        "PHYSICAL_CONTAINER_LIMIT": 10,
+                                        "PHYSICAL_CLIENT_COUNT": os.getenv(
+                                            "PHYSICAL_CLIENT_COUNT", "3"),
                                         "LOGICAL_SPLIT_MODE": split,
                                         "EXPERIMENT_METHOD": selector,
                                         "SELECTION_MODE": os.getenv("SELECTION_MODE", "cup"),

@@ -1,4 +1,3 @@
-
 import copy
 import math
 import os
@@ -64,7 +63,8 @@ class TopologyProvider:
         self.sample_images = []
         self.utility_log = defaultdict(float)  # Tracks cumulative utility u_k(T)
         self.previous_losses = {}  # Stores last loss per client
-        self.transform = self.get_transform() 
+        self.transform = self.get_transform()
+        self.logical_loaders = {} 
         self.cifar_loader = self.load_cifar_data()
         self.dht = DHT(size=100)  # Initialize the DHT
         self.availability_predictor = AvailabilityPredictor(node_count=len(device_names) * num_workers)
@@ -217,16 +217,43 @@ class TopologyProvider:
         return train_loader
 
 
-    def run_local_training(self, global_weights, local_epochs=5):
-        """Train locally using persistent model/optimizer."""
-        if global_weights is not None:
-           # Merge global weights with local model instead of full overwrite
-           current_state = self.model.state_dict()
-           for key in current_state.keys():
-              if key in global_weights:
-                 current_state[key] = 0.5 * current_state[key] + 0.5 * global_weights[key]
-           self.model.load_state_dict(current_state)
+    def _logical_loader(self, logical_id, labels_per_client):
+        """Build and cache the requested logical client's deterministic shard."""
+        key = (logical_id, labels_per_client)
+        if key in self.logical_loaders:
+            return self.logical_loaders[key]
+        dataset = datasets.CIFAR10(
+            root='data/', train=True, download=False, transform=self.transform)
+        logical_index = int(''.join(filter(str.isdigit, logical_id)) or 0)
+        label_count = labels_per_client or 2
+        wanted = {(logical_index + offset) % 10 for offset in range(label_count)}
+        indices = [index for index, label in enumerate(dataset.targets)
+                   if label in wanted]
+        limit = int(os.getenv("LOGICAL_CLIENT_SUBSET_SIZE", "1000"))
+        rng = random.Random(logical_index)
+        rng.shuffle(indices)
+        loader = DataLoader(
+            torch.utils.data.Subset(dataset, indices[:limit]),
+            batch_size=32, shuffle=False)
+        self.logical_loaders[key] = loader
+        return loader
 
+    def run_local_training(self, global_weights, local_epochs=5,
+                           logical_id=None, labels_per_client=None):
+        """Train one logical client from the supplied global model."""
+        if global_weights is not None:
+           # A physical worker may execute many logical clients and successive
+           # experiment seeds. Never leak the previous request's model or Adam
+           # moments into the next logical client.
+           self.model.load_state_dict(global_weights)
+           self.optimizer = optim.Adam(
+               filter(lambda parameter: parameter.requires_grad,
+                      self.model.parameters()),
+               lr=0.001,
+           )
+
+        train_loader = (self._logical_loader(logical_id, labels_per_client)
+                        if logical_id is not None else self.cifar_loader)
         # Training loop
         for epoch in range(local_epochs): 
             self.model.train()
@@ -234,7 +261,7 @@ class TopologyProvider:
             correct_predictions = 0
             total_predictions = 0
 
-            for i, (inputs, labels) in enumerate(self.cifar_loader):  # Assuming train_loader is your DataLoader
+            for i, (inputs, labels) in enumerate(train_loader):
                 self.optimizer.zero_grad()
 
                 # Forward pass

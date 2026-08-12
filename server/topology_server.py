@@ -259,7 +259,16 @@ class TopologyProvider:
                torch.save(global_weights, buffer)
                buffer.seek(0)
                files = {"weights": ("model.pth", buffer)}
+               form = {
+                   "sync_only": str(bool(sync_only)),
+                   "logical_id": "" if logical_id is None else str(logical_id),
+                   "logical_labels_per_client": (
+                       "" if logical_labels_per_client is None
+                       else str(logical_labels_per_client)),
+               }
 
+               timeout = float(os.getenv("CLIENT_TRAIN_TIMEOUT_SECONDS", "600"))
+               response = requests.post(url, files=files, data=form, timeout=timeout)
                response = requests.post(url, files=files, timeout=5000)
 
                if response.status_code == 200:
@@ -349,15 +358,29 @@ class TopologyProvider:
         if not weight_list:
            print("⚠️ No weights to aggregate (no clients participated this round).")
            return None  # or return last global weights, or reinitialize
-        new_state = copy.deepcopy(weight_list[0])
+        # Logical rounds retain an optional aggregation weight alongside each
+        # state dict.  The previous implementation treated that tuple as a state
+        # dict and crashed while indexing it with an OrderedDict key.
+        weighted = []
+        for update in weight_list:
+            if (isinstance(update, tuple) and len(update) == 2
+                    and isinstance(update[0], dict)):
+                weighted.append((update[0], float(update[1])))
+            else:
+                weighted.append((update, 1.0))
+        total_weight = sum(weight for _, weight in weighted)
+        if total_weight <= 0:
+            return None
+        new_state = copy.deepcopy(weighted[0][0])
         for key in new_state:
             if torch.is_floating_point(new_state[key]):
-               new_state[key] = sum(w[key] for w in weight_list) / len(weight_list)
+               new_state[key] = sum(
+                   state[key] * weight for state, weight in weighted
+               ) / total_weight
             else:
                # Non-float types (e.g. LongTensor): just copy the first one
-               new_state[key] = weight_list[0][key]
+               new_state[key] = weighted[0][0][key]
         return new_state  
-
 
     def evaluate_global_model(self, model, selected_nodes=None, subset_size=1000, use_selected_nodes=True):
         correct = total = 0

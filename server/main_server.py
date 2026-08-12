@@ -13,6 +13,7 @@ from pathlib import Path
 from torchvision import models
 from shared_state import topology
 import threading
+import random
 import requests
 import socket
 from topology_server import TopologyProvider
@@ -120,7 +121,9 @@ def ready():
         return "ready", 200
     return "not_ready", 503
 
-def initialize_topology(device_file="devices.txt", num_clients=3):
+def initialize_topology(device_file="devices.txt", num_clients=None):
+    num_clients = (int(os.getenv("PHYSICAL_CLIENT_COUNT", "3"))
+                   if num_clients is None else num_clients)
     print("⏳ Waiting for clients to register...")
     while len(device_registry) < num_clients:
         print(f"🕒 Registered devices: {len(device_registry)} / {num_clients}")
@@ -166,8 +169,7 @@ def initialize_topology(device_file="devices.txt", num_clients=3):
           "correlation": None
         }
     print("✅ Topology initialized.")
-    wait_for_latency_data()
-
+    wait_for_latency_data(num_clients)
 
 
 @app.route("/status_update", methods=["POST"])
@@ -245,7 +247,7 @@ def run_federated_training():
     seed = int(os.getenv("EXPERIMENT_SEED", "42"))
     np.random.seed(seed)
     torch.manual_seed(seed)
-
+    rng = random.Random(seed)
 
 
 
@@ -278,12 +280,27 @@ def run_federated_training():
     metrics_path = os.getenv("METRICS_LOG_PATH", "metrics_log.csv")
     Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
 
-    with open(metrics_path, "w", newline="") as output:
+
+    final_metrics_path = os.getenv("FINAL_METRICS_PATH", "final_metrics.csv")
+    Path(final_metrics_path).parent.mkdir(parents=True, exist_ok=True)
+    final_fields = [
+        "Round", "global_accuracy", "mean_client_accuracy",
+        "worst_10_percent_utility", "Utility CV (No Surrogate)",
+        "Jain (Utility) (No Surrogate)", "Sel. Gap (No Surrogate)",
+        "Utility CV (With Surrogate)", "Jain (Utility) (With Surrogate)",
+        "Sel. Gap (With Surrogate)", "runtime_seconds",
+    ]
+    training_started = time.perf_counter()
+
+    with open(metrics_path, "w", newline="") as output, open(
+            final_metrics_path, "w", newline="") as final_output:
         writer = csv.DictWriter(output, fieldnames=[
             "round", "method", "accuracy", "participation_gini",
             "participation_variance", "selected_clients",
         ])
         writer.writeheader()
+        final_writer = csv.DictWriter(final_output, fieldnames=final_fields)
+        final_writer.writeheader()
         for current_round in range(int(os.getenv("NUM_ROUNDS", 50))):
             physical_ids = list(device_registry)[:physical_limit]
             if use_logical:
@@ -343,7 +360,6 @@ def run_federated_training():
                 model.load_state_dict(weights)
                 accuracy = shared_state.topology.evaluate_global_model(
                     model, selected_nodes=selected, use_selected_nodes=False,
-                    physical_ids=physical_ids if use_logical else None,
                 )
 
 
@@ -366,11 +382,39 @@ def run_federated_training():
                 "participation_variance": variance, "selected_clients": selected,
             })
             output.flush()
+
+
+            observed_utilities = [
+                utility_sums[client_id] / utility_observations[client_id]
+                if utility_observations[client_id] else 0.0
+                for client_id in client_ids
+            ]
+            utility_by_client = dict(zip(client_ids, observed_utilities))
+            utility_fairness = fairness_metrics(utility_by_client, selection_counts)
+            tail_size = max(1, math.ceil(len(observed_utilities) * 0.1))
+            final_writer.writerow({
+                "Round": current_round + 1,
+                "global_accuracy": accuracy,
+                "mean_client_accuracy": (
+                    sum(observed_utilities) / len(observed_utilities)
+                    if observed_utilities else 0.0),
+                "worst_10_percent_utility": (
+                    sum(sorted(observed_utilities)[:tail_size]) / tail_size),
+                "Utility CV (No Surrogate)": utility_fairness["utility_cv"],
+                "Jain (Utility) (No Surrogate)": utility_fairness["utility_jain_index"],
+                "Sel. Gap (No Surrogate)": utility_fairness["selection_gap"],
+                "Utility CV (With Surrogate)": utility_fairness["utility_cv"],
+                "Jain (Utility) (With Surrogate)": utility_fairness["utility_jain_index"],
+                "Sel. Gap (With Surrogate)": utility_fairness["selection_gap"],
+                "runtime_seconds": time.perf_counter() - training_started,
+            })
+            final_output.flush()
+
             print(f"Round {current_round + 1}: {selector} accuracy={accuracy} selected={selected}")
 
 
 
-def wait_for_latency_data(num_clients=2):
+def wait_for_latency_data(num_clients=3):
     print("⏳ Waiting for latency updates from clients...")
     while True:
         ready = 0
@@ -396,7 +440,11 @@ if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
 
     # Step 2: Start topology initialization in the background
-    threading.Thread(target=initialize_topology).start()
+#    threading.Thread(target=initialize_topology).start()
+    # Keep Flask in the background but run coordination on the main thread.
+    # Exceptions during training must make the child process fail instead of
+    # being hidden in a thread while experiment_suite reports a normal exit.
+    initialize_topology()
 
     # Step 3: Wait for latency info from clients, then start training
     #threading.Thread(target=wait_for_latency_data).start()

@@ -109,7 +109,8 @@ def train():
         # Load posted weights
         raw_weights = request.files["weights"].read()
         state_dict = torch.load(io.BytesIO(raw_weights), map_location="cpu")
-
+        logical_id = request.form.get("logical_id") or None
+        labels_per_client = request.form.get("logical_labels_per_client") or None
 
         # Parse sync_only flag
 #        sync_only = request.form.get("sync_only", "False") == "True"
@@ -121,7 +122,10 @@ def train():
         # Perform training
         updated_weights = topology.run_local_training(
                 global_weights=state_dict,
-                local_epochs=3
+                local_epochs=int(os.getenv("LOCAL_EPOCHS", "1")),
+                logical_id=logical_id,
+                labels_per_client=(int(labels_per_client)
+                                   if labels_per_client is not None else None),
             )
         trace.advance()  # ⬅️ Move to next trace after training
         print("✅ Training completed. Advanced trace.")
@@ -195,6 +199,10 @@ def send_status_update():
 def periodic_status_update(interval=10, max_updates=5):
      while True:
 #    for _ in range(max_updates):
+        # Experiment suites restart the coordinator between seeds. Re-register
+        # idempotently so the same long-lived physical containers are reused by
+        # every child server instead of waiting for new containers.
+        register_with_main_server()
         send_status_update()
         time.sleep(interval)
 

@@ -116,11 +116,9 @@ def fairness_metrics(normalized_utilities: Mapping[str, float], selection_counts
     abs_diffs = sum(abs(x-y) for x in values for y in values)
     gini = abs_diffs / (2*len(values)*sum(values)) if values and sum(values) > 0 else 0.0
     counts = list(selection_counts.values())
-    worst_count = max(1, math.ceil(len(values)*.10)) if values else 0
     return {"utility_cv": std/mean if mean else 0.0, "utility_jain_index": jain,
             "selection_gap": max(counts)-min(counts) if counts else 0,
             "gini_coefficient": gini, "worst_client_utility": min(values) if values else 0.0,
-            "worst_10_percent_utility": statistics.fmean(sorted(values)[:worst_count]) if values else 0.0,
             "mean_utility": mean}
 
 
@@ -226,15 +224,23 @@ class RoundCoordinator:
         self.clients,self.m=list(clients),m; self.estimator=AvailabilityEstimator(window_size); self.scheduler=make_scheduler(selection_mode,seed); self.utilities=UtilityTracker(utility_definition)
         self.surrogate_mode,self.lambda_decay,self.eta0=surrogate_mode,lambda_decay,eta0; self.selection_counts,self.participation_counts=defaultdict(int),defaultdict(int)
         self.utility_sums,self.utility_observations=defaultdict(float),defaultdict(int); self.last_participated={}; self.logger=RoundLogger(output_dir); self.overhead=RuntimeOverhead()
+
     def begin_round(self,round_index,telemetry):
         start=time.perf_counter(); self.estimator.observe(telemetry); estimates=self.estimator.estimates(self.clients); self.overhead.availability_estimation_runtime += time.perf_counter()-start
         mu_hat={k:self.utility_sums[k]/self.utility_observations[k] if self.utility_observations[k] else 1.0 for k in self.clients}; start=time.perf_counter()
-        if isinstance(self.scheduler,CumulativeUtilityParityScheduler): selected=self.scheduler.select(self.clients,self.m,availability=telemetry,pi_hat=estimates,mu_hat=mu_hat,budget=min(self.m,sum(estimates.values())))
+        if isinstance(self.scheduler,CumulativeUtilityParityScheduler):
+            # Selection precedes realization of participation in this coordinator:
+            # an offline selected client is logged as selected but not participated.
+            # Smooth a first-round zero estimate so the CUP rate calculation remains
+            # defined until that client has an observed availability opportunity.
+            smoothed={k:max(value,1e-12) for k,value in estimates.items()}
+            selected=self.scheduler.select(self.clients,self.m,availability={k:True for k in self.clients},pi_hat=smoothed,mu_hat=mu_hat,budget=min(self.m,sum(smoothed.values())))
         else: selected=self.scheduler.select(self.clients,self.m,estimates)
         self.overhead.scheduler_runtime += time.perf_counter()-start; participated=[k for k in selected if telemetry.get(k,False)]
         for k in selected:self.selection_counts[k]+=1
         for k in participated:self.participation_counts[k]+=1;self.last_participated[k]=round_index
         return selected,participated
+
     def log_round(self,round_index,telemetry,selected,metrics,surrogate_errors=None):
         surrogate_errors=surrogate_errors or {}; surrogate_weights={k:surrogate_weight(self.eta0,self.lambda_decay,round_index-self.last_participated.get(k,round_index)) for k in surrogate_errors}; aggregate_bias=surrogate_bias_bound(surrogate_errors,surrogate_weights)
         for k in self.clients:
