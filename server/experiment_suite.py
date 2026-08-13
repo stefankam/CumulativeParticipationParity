@@ -19,6 +19,12 @@ import sys
 import argparse
 from collections import deque
 from pathlib import Path
+from baselines import RUNNABLE_BASELINES
+
+CPP_METHOD = "select_fair_nodes"
+DEFAULT_EXPERIMENT_METHODS = (CPP_METHOD,) + RUNNABLE_BASELINES
+
+
 
 def resolve_paths():
     script_path = Path(__file__).resolve()
@@ -131,7 +137,7 @@ def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
         candidate = {
             "dataset": run["dataset"],
             "seed": run["seed"],
-            "method": run["selector"],
+            "method": "cpp" if run["selector"] == CPP_METHOD else run["selector"],
             "availability_model": run["availability_model"],
             "ablation": run["ablation"],
             "global_accuracy": final.get("global_accuracy"),
@@ -238,6 +244,7 @@ def run_case(env_overrides, run_tag, progress_callback=None):
                     "Error", "Exception", "Traceback", "No updates received",
                     "No fair-select updates", "No AW-PSP updates",
                     "No OORT updates", "No PSP updates",
+                    "No client model updates",
                     "unavailable", "failed after")):
                 diagnostic_tail.append(line)
             if progress_callback is not None:
@@ -276,7 +283,16 @@ def run_suite(live_graphs=False):
     selections = [10]
     split_modes = ["overlap"]
     labels_per_client_options = [2]
-    selectors = [item for item in os.getenv("EXPERIMENT_METHODS", "select_fair_nodes").split(",") if item]
+    selectors = [
+        item.strip() for item in os.getenv(
+            "EXPERIMENT_METHODS", ",".join(DEFAULT_EXPERIMENT_METHODS)
+        ).split(",") if item.strip()
+    ]
+    unknown = set(selectors) - set(DEFAULT_EXPERIMENT_METHODS)
+    if unknown:
+        raise ValueError(
+            f"Unknown EXPERIMENT_METHODS entries: {sorted(unknown)}; choose from "
+            f"{', '.join(DEFAULT_EXPERIMENT_METHODS)}")
     noises = [0]
     seeds = [0, 1, 2, 3, 4]
     rounds_per_run = int(os.getenv("NUM_ROUNDS", "50"))

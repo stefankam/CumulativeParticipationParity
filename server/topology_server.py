@@ -265,6 +265,8 @@ class TopologyProvider:
                    "logical_labels_per_client": (
                        "" if logical_labels_per_client is None
                        else str(logical_labels_per_client)),
+                   "method": os.getenv("SELECTOR_MODE", "fedavg_random"),
+                   "fedprox_mu": os.getenv("FEDPROX_MU", "0.01"),
                }
 
                timeout = float(os.getenv("CLIENT_TRAIN_TIMEOUT_SECONDS", "600"))
@@ -312,7 +314,8 @@ class TopologyProvider:
                 logical_labels_per_client=self.logical_labels_per_client,
             )
             if client_weights is not None:
-                return (client_weights, 1.0)
+                client_weights["client_id"] = logical_id
+                return client_weights
             print(f"⚠️ Logical client {logical_id} via {physical_id} timed out/skipped.")
             return None
 
@@ -330,7 +333,7 @@ class TopologyProvider:
                     if result is not None:
                         updated_weights.append(result)
 
-        return self.aggregate_weights(updated_weights)
+        return self.aggregate_weights(updated_weights, global_weights)
 
 	
 
@@ -355,38 +358,87 @@ class TopologyProvider:
             if client_weights is not None:
                 updated_weights.append(client_weights)
 
-        return self.aggregate_weights(updated_weights)
+        return self.aggregate_weights(updated_weights, global_weights)
 
 
 
 
-    def aggregate_weights(self, weight_list):
+
+
+    def aggregate_weights(self, weight_list, global_weights=None):
         if not weight_list:
            print("⚠️ No weights to aggregate (no clients participated this round).")
            return None  # or return last global weights, or reinitialize
         # Logical rounds retain an optional aggregation weight alongside each
         # state dict.  The previous implementation treated that tuple as a state
         # dict and crashed while indexing it with an OrderedDict key.
-        weighted = []
+        method = os.getenv("SELECTOR_MODE", "fedavg_random").lower()
+        records = []
         for update in weight_list:
-            if (isinstance(update, tuple) and len(update) == 2
-                    and isinstance(update[0], dict)):
-                weighted.append((update[0], float(update[1])))
+            if "state_dict" in update:
+                records.append(update)
+            elif (isinstance(update, tuple) and len(update) == 2):
+                records.append({"state_dict": update[0], "sample_count": update[1], "loss": 1.0})
             else:
-                weighted.append((update, 1.0))
-        total_weight = sum(weight for _, weight in weighted)
+                records.append({"state_dict": update, "sample_count": 1, "loss": 1.0})
+        raw = []
+        for record in records:
+            samples, loss = float(record.get("sample_count", 1)), max(float(record.get("loss", 1)), 1e-12)
+            if method == "q_ffl": raw.append(samples * loss ** float(os.getenv("Q_FFL_Q", "1")))
+            elif method in {"php_fl", "fairfedcs"}: raw.append(samples / (1 + self.utility_log[record.get("client_id", "")]))
+            elif method == "afl": raw.append(math.exp(float(os.getenv("AFL_ETA", ".1")) * loss))
+            else: raw.append(samples)
+        total_weight = sum(raw)
         if total_weight <= 0:
             return None
+        weighted = [(record["state_dict"], weight / total_weight)
+                    for record, weight in zip(records, raw)]
+        if method == "q_ffl" and global_weights is not None:
+            q = float(os.getenv("Q_FFL_Q", "1"))
+            learning_rate = float(os.getenv("CLIENT_LEARNING_RATE", ".001"))
+            deltas, hs = [], []
+            for record in records:
+                loss = max(float(record.get("loss", 1)), 1e-12)
+                delta = {key: global_weights[key] - record["state_dict"][key]
+                         for key in global_weights
+                         if torch.is_floating_point(global_weights[key])}
+                squared_norm = sum((value * value).sum().item() for value in delta.values())
+                loss_q = loss ** q
+                deltas.append((delta, loss_q))
+                hs.append(q * loss ** (q - 1) * squared_norm + loss_q / learning_rate)
+            denominator = sum(hs)
+            result = copy.deepcopy(global_weights)
+            for key in result:
+                if torch.is_floating_point(result[key]):
+                    result[key] = global_weights[key] - sum(
+                        delta[key] * loss_q for delta, loss_q in deltas) / denominator
+            return result
+        # FedFV projects conflicting client model deltas before averaging.
+        if method == "fedfv" and global_weights is not None:
+            deltas = [{key: state[key] - global_weights[key] for key in state
+                       if torch.is_floating_point(state[key])} for state, _ in weighted]
+            for i in range(len(deltas)):
+                for j in range(len(deltas)):
+                    if i == j: continue
+                    dot = sum((deltas[i][key] * deltas[j][key]).sum() for key in deltas[i])
+                    norm = sum((value * value).sum() for value in deltas[j])
+                    if dot < 0 and norm > 0:
+                        coefficient = dot / norm
+                        for key in deltas[i]: deltas[i][key] -= coefficient * deltas[j][key]
+            weighted = [({**state, **{key: global_weights[key] + delta[key] for key in delta}}, weight)
+                        for (state, weight), delta in zip(weighted, deltas)]
         new_state = copy.deepcopy(weighted[0][0])
         for key in new_state:
             if torch.is_floating_point(new_state[key]):
                new_state[key] = sum(
-                   state[key] * weight for state, weight in weighted
-               ) / total_weight
+                   state[key] * weight for state, weight in weighted)
             else:
                # Non-float types (e.g. LongTensor): just copy the first one
                new_state[key] = weighted[0][0][key]
         return new_state  
+
+
+
 
     def evaluate_global_model(self, model, selected_nodes=None, subset_size=1000, use_selected_nodes=True):
         correct = total = 0

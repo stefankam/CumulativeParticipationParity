@@ -229,7 +229,15 @@ class TopologyProvider:
         wanted = {(logical_index + offset) % 10 for offset in range(label_count)}
         indices = [index for index, label in enumerate(dataset.targets)
                    if label in wanted]
-        limit = int(os.getenv("LOGICAL_CLIENT_SUBSET_SIZE", "1000"))
+
+        # A physical worker executes several logical clients per round.  A
+        # 1,000-example shard with ResNet-18 regularly exceeds the server's
+        # 600-second HTTP deadline on CPU (the reported ~2,412 seconds is four
+        # waves timing out at that deadline).  Keep the default simulation
+        # workload bounded; larger paper workloads remain opt-in via the env.
+        limit = int(os.getenv("LOGICAL_CLIENT_SUBSET_SIZE", "100"))
+        if limit <= 0:
+            raise ValueError("LOGICAL_CLIENT_SUBSET_SIZE must be positive")
         rng = random.Random(logical_index)
         rng.shuffle(indices)
         loader = DataLoader(
@@ -239,7 +247,8 @@ class TopologyProvider:
         return loader
 
     def run_local_training(self, global_weights, local_epochs=5,
-                           logical_id=None, labels_per_client=None):
+                           logical_id=None, labels_per_client=None,
+                           method="fedavg_random", fedprox_mu=0.01):
         """Train one logical client from the supplied global model."""
         if global_weights is not None:
            # A physical worker may execute many logical clients and successive
@@ -254,6 +263,8 @@ class TopologyProvider:
 
         train_loader = (self._logical_loader(logical_id, labels_per_client)
                         if logical_id is not None else self.cifar_loader)
+        reference = {name: value.detach().clone()
+                     for name, value in global_weights.items()}
         # Training loop
         for epoch in range(local_epochs): 
             self.model.train()
@@ -269,6 +280,11 @@ class TopologyProvider:
 
                 # Compute loss
                 loss = self.criterion(outputs, labels)
+                if method == "fedprox":
+                    proximal = sum(
+                        (parameter - reference[name].to(parameter.device)).pow(2).sum()
+                        for name, parameter in self.model.named_parameters())
+                    loss = loss + 0.5 * float(fedprox_mu) * proximal
 
                 # Backward pass and optimization
                 loss.backward()
@@ -283,13 +299,17 @@ class TopologyProvider:
                 total_predictions += labels.size(0)  # Total predictions
 
             # Calculate average loss and accuracy for the epoch
-            avg_loss = running_loss / len(self.cifar_loader)
+            avg_loss = running_loss / len(train_loader)
             accuracy = (correct_predictions / total_predictions) * 100
 
             print(f"epoch [{epoch+1}/{local_epochs}], Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
 
         # Return updated weights to the server
-        return self.model.state_dict()
+        return {
+            "state_dict": self.model.state_dict(),
+            "loss": avg_loss,
+            "sample_count": len(train_loader.dataset),
+        }
 
 
     def run_federated_round(self, selected_hosts, global_weights, model=None):

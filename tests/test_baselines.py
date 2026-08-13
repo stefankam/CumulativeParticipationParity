@@ -6,7 +6,25 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "server"))
 from baselines import (BASELINE_SOURCES, BaselineUnavailableError, fedavg, qfedavg,
-                       require_reference_baseline)
+                       require_reference_baseline, RUNNABLE_BASELINES,
+                       UNIMPLEMENTED_BASELINES, BaselineClient, BaselineState,
+                       select_clients)
+import random
+
+
+def test_runnable_registry_does_not_claim_unwired_optimizers():
+    assert not UNIMPLEMENTED_BASELINES
+    assert {"fedprox", "q_ffl", "php_fl", "fairfedcs", "fedfv", "afl"} <= set(RUNNABLE_BASELINES)
+
+
+def test_fairfedcs_and_php_prioritize_participation_debt():
+    clients = [BaselineClient("often", selections=5),
+               BaselineClient("rare", selections=0)]
+    for method in ("fairfedcs", "php_fl"):
+        state = BaselineState()
+        state.selections["often"] = 5
+        assert select_clients(method, clients, 1, state,
+                              rng=random.Random(0)) == ["rare"]
 
 
 def test_fedavg_uses_sample_counts():

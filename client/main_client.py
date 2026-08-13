@@ -111,6 +111,8 @@ def train():
         state_dict = torch.load(io.BytesIO(raw_weights), map_location="cpu")
         logical_id = request.form.get("logical_id") or None
         labels_per_client = request.form.get("logical_labels_per_client") or None
+        method = request.form.get("method", "fedavg_random")
+
 
         # Parse sync_only flag
 #        sync_only = request.form.get("sync_only", "False") == "True"
@@ -126,6 +128,8 @@ def train():
                 logical_id=logical_id,
                 labels_per_client=(int(labels_per_client)
                                    if labels_per_client is not None else None),
+                method=method,
+                fedprox_mu=float(request.form.get("fedprox_mu", "0.01")),
             )
         trace.advance()  # ⬅️ Move to next trace after training
         print("✅ Training completed. Advanced trace.")

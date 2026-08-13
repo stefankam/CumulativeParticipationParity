@@ -68,6 +68,35 @@ Clients register via `/register`, wait for topology initialization, send periodi
 * Availability traces and correlated dropout patterns can be configured in the client code.
 * All fairness and performance metrics are logged in CSV format on the server side.
 
+## Benchmark comparison graphs
+
+Run the experiment suite from the server environment with:
+
+```bash
+python3 experiment_suite.py all
+```
+
+By default the suite runs five seeds for CPP and all comparison methods:
+FedAvg-random, uniform-among-available, FedProx, q-FFL, PHP-FL, FairFedCS,
+FedFV, AFL, round-robin, least-selected, deficit-based, inverse availability,
+oracle availability, and estimated availability. The resulting PDF files under
+`benchmark_graphs/` use a separate bar for each method. Override the matrix with
+a comma-separated list when a smaller smoke test is needed, for example:
+
+```bash
+EXPERIMENT_METHODS=fedavg_random,least_selected,select_fair_nodes \
+NUM_ROUNDS=1 python3 experiment_suite.py all
+```
+
+Graphs only compare rows that actually exist in `benchmark_results.csv`; running
+`experiment_suite.py graphs` after a single-method experiment cannot create
+measurements for methods that were not run.
+
+The optimization baselines are integrated end-to-end: clients report local loss
+and sample count, FedProx adds its proximal objective locally, q-FFL and AFL use
+loss-aware aggregation, PHP-FL and FairFedCS combine participation-debt selection
+with fairness-aware aggregation, and FedFV projects conflicting model deltas.
+
 ---
 
 ## License

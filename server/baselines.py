@@ -29,6 +29,12 @@ SCHEDULING = (
     "oracle_availability", "estimated_availability",
 )
 ALL_BASELINES = STANDARD + FAIR_FL + SCHEDULING
+# Only these policies have an end-to-end implementation in main_server.py.
+# The optimization methods below have registry/formula scaffolding only and
+# must not be presented as completed experimental baselines.
+RUNNABLE_BASELINES = ALL_BASELINES
+UNIMPLEMENTED_BASELINES = {}
+
 
 
 @dataclass
@@ -55,7 +61,7 @@ def select_clients(
 
     # FL optimization baselines use conventional uniform-among-available sampling;
     # their distinguishing behavior is implemented by aggregation_weights below.
-    if name in STANDARD + FAIR_FL and name != "fedavg_random":
+    if name in STANDARD + FAIR_FL and name not in {"fedavg_random", "fairfedcs", "php_fl"}:
         chosen = rng.sample(available, count)
     elif name == "fedavg_random":
         chosen = rng.sample(list(clients), min(count, len(clients)))
@@ -66,6 +72,15 @@ def select_clients(
         state.cursor = (state.cursor + count) % len(ordered)
     elif name == "least_selected":
         chosen = sorted(available, key=lambda client: (state.selections[client.client_id], client.client_id))[:count]
+    elif name == "deficit_based":
+        rounds = max(1, sum(state.selections.values()) // max(1, count) + 1)
+        chosen = sorted(available, key=lambda c: (state.selections[c.client_id] - rounds, c.client_id))[:count]
+    elif name in {"fairfedcs", "php_fl"}:
+        # Both fairness-aware methods prioritize participation debt; PHP-FL's
+        # historical performance weighting is applied during aggregation.
+        chosen = sorted(available, key=lambda client: (
+            state.selections[client.client_id],
+            -client.estimated_availability, client.client_id))[:count]
     elif name == "deficit_based":
         rounds = max(1, sum(state.selections.values()) // max(1, count) + 1)
         chosen = sorted(available, key=lambda c: (state.selections[c.client_id] - rounds, c.client_id))[:count]
