@@ -51,7 +51,16 @@ def validate_results(rows):
 def _aggregate(rows, metric):
     grouped = defaultdict(list)
     for row in rows:
-        grouped[(row["dataset"], row["method"], row["availability_model"], row["ablation"])].append(float(row[metric]))
+        value = row.get(metric)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(number):
+            continue
+        grouped[(row["dataset"], row["method"], row["availability_model"], row["ablation"])].append(number)
     return [(key, sum(values) / len(values),
              math.sqrt(sum((x - sum(values) / len(values)) ** 2 for x in values) / max(1, len(values) - 1)))
             for key, values in sorted(grouped.items())]

@@ -268,8 +268,14 @@ class TopologyProvider:
                }
 
                timeout = float(os.getenv("CLIENT_TRAIN_TIMEOUT_SECONDS", "600"))
-               response = requests.post(url, files=files, data=form, timeout=timeout)
-               response = requests.post(url, files=files, timeout=5000)
+               # Send exactly one request.  The former second POST reused the
+               # already-consumed BytesIO object, omitted the logical-client
+               # form fields, and overwrote the successful first response.
+               # Consequently every logical update was commonly discarded and
+               # all accuracy/utility metrics stayed empty or zero.
+               response = requests.post(
+                   url, files=files, data=form, timeout=timeout)
+
 
                if response.status_code == 200:
                   return torch.load(io.BytesIO(response.content), map_location="cpu")

@@ -110,7 +110,10 @@ def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
     """
     benchmark_rows = []
     for run in rows:
-        if run["return_code"] != 0:
+        # Code 2 means the child completed but no round produced a global
+        # accuracy.  Keep its other real measurements; process failures and
+        # incomplete runs remain excluded.
+        if run["return_code"] not in (0, 2):
             continue
         if (not include_in_progress
                 and run["completed_rounds"] < run["expected_rounds"]):
@@ -139,7 +142,14 @@ def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
             "conditional_selection_gap": final.get(f"Sel. Gap ({suffix})"),
             "runtime_seconds": final.get("runtime_seconds"),
         }
-        if all(candidate[field] not in (None, "") for field in BENCHMARK_FIELDS):
+        # Preserve partial real measurements.  A round with no client update
+        # legitimately has a blank global accuracy, but its utility/fairness
+        # and runtime measurements are still graphable.  Requiring every value
+        # used to discard the entire row and leave benchmark_results.csv empty.
+        metadata_fields = BENCHMARK_FIELDS[:5]
+        metric_fields = BENCHMARK_FIELDS[5:]
+        if (all(candidate[field] not in (None, "") for field in metadata_fields)
+                and any(candidate[field] not in (None, "") for field in metric_fields)):
             benchmark_rows.append(candidate)
 
     with Path(destination).open("w", newline="") as handle:
@@ -193,6 +203,10 @@ def run_case(env_overrides, run_tag, progress_callback=None):
 
     print(f"[suite] launching: {' '.join(cmd)}", flush=True)
     env["METRICS_LOG_PATH"] = str(metrics_path)
+    # Keep each child's final metrics beside its round trace.  Without this
+    # override every child writes ROOT/final_metrics.csv while the suite polls
+    # experiment_runs/final_<tag>.csv, so live artifacts can never advance.
+    env["FINAL_METRICS_PATH"] = str(final_path)
     env["SELECTOR_MODE"] = str(env_overrides.get("EXPERIMENT_METHOD", "select_fair_nodes"))
     env["REUSE_REGISTERED_CLIENTS"] = os.getenv("REUSE_REGISTERED_CLIENTS", "1")
     print(f"[suite] env: {env_overrides}", flush=True)
@@ -319,6 +333,12 @@ def run_suite(live_graphs=False):
                                     "metrics_path": "", "final_metrics_path": "",
                                 }
                                 rows.append(live_row)
+                                # Make the in-progress run visible immediately.
+                                # A federated round can take a long time, and an
+                                # empty index during that time looks like a
+                                # failed suite.
+                                write_experiment_results(rows, result_fields)
+                                write_results_summary(rows)
                                 last_persisted_round = -1
 
                                 def persist_round(metrics_file, final_file):
