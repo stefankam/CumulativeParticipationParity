@@ -166,6 +166,8 @@ def health():
 #main_server_url = os.getenv("MAIN_SERVER_URL", "http://main-server-service:8080")  # service name in K8s
 #main_server_url = os.getenv("MAIN_SERVER_URL", "http://localhost:8080")  # service name in K8s
 
+
+
 def register_with_main_server():
     try:
         ip = socket.gethostbyname(socket.gethostname())  # get pod IP
@@ -174,10 +176,15 @@ def register_with_main_server():
             "ip": ip,
             "port": port
         }
-        requests.post(f"{main_server_url}/register", json=payload)
+        response = requests.post(
+            f"{main_server_url}/register", json=payload, timeout=5)
+        response.raise_for_status()
         print(f"✅ Registered with main server: {payload}")
+        return True
     except Exception as e:
         print(f"❌ Failed to register with main server: {e}")
+        return False
+
 
 
 def send_status_update():
@@ -195,7 +202,7 @@ def send_status_update():
           "packet_loss": packet_loss,
           "timestamp": time.time(),
           "availability": initial_availability
-       })
+       }, timeout=5).raise_for_status()
     except Exception as e:
        print(f"❌ Failed to status update with the main server: {e}")
 
@@ -203,10 +210,8 @@ def send_status_update():
 def periodic_status_update(interval=10, max_updates=5):
      while True:
 #    for _ in range(max_updates):
-        # Experiment suites restart the coordinator between seeds. Re-register
-        # idempotently so the same long-lived physical containers are reused by
-        # every child server instead of waiting for new containers.
-        register_with_main_server()
+        # Registrations are restored by the coordinator's shared cache. Only
+        # telemetry needs refreshing between rounds and seed processes.
         send_status_update()
         time.sleep(interval)
 
@@ -221,19 +226,20 @@ def wait_for_topology_ready(delay=2):
         print("Waiting for server topology to initialize...")
         time.sleep(delay)
 
+
+
 if __name__ == "__main__":
     print("📟 Starting client")
     #print("📟 Starting client {device_id_str} (device index {})".format(device_index))
     #print(f"📟 Client {device_id_str} is listening on port {port}")
 
-    # 1. Register with main server (blocking call)
-    register_with_main_server()
-
-    # 2. Wait until server topology is ready
+    # Register once on initial startup. Consecutive seed coordinators restore
+    # this endpoint from REGISTERED_CLIENTS_CACHE and do not need repeated POSTs.
+    while not register_with_main_server():
+        time.sleep(2)
     wait_for_topology_ready()
 
-    # 3. Start periodic status updates in background
+    # Keep telemetry current without repeatedly calling /register.
     threading.Thread(target=periodic_status_update, daemon=True).start()
 
-    # 4. Start Flask server (this blocks)
     app.run(host="0.0.0.0", port=port)

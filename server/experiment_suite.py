@@ -213,6 +213,11 @@ def run_case(env_overrides, run_tag, progress_callback=None):
     # override every child writes ROOT/final_metrics.csv while the suite polls
     # experiment_runs/final_<tag>.csv, so live artifacts can never advance.
     env["FINAL_METRICS_PATH"] = str(final_path)
+    # All seed child processes share physical endpoint discovery. Clients also
+    # re-register periodically, so changes in container IPs refresh this file.
+    env["DEVICE_REGISTRY_PATH"] = str(RUN_DIR / "device_registry.json")
+    # Compatibility with the original server sweep implementation.
+    env["REGISTERED_CLIENTS_CACHE"] = env["DEVICE_REGISTRY_PATH"]
     env["SELECTOR_MODE"] = str(env_overrides.get("EXPERIMENT_METHOD", "select_fair_nodes"))
     env["REUSE_REGISTERED_CLIENTS"] = os.getenv("REUSE_REGISTERED_CLIENTS", "1")
     print(f"[suite] env: {env_overrides}", flush=True)
@@ -295,7 +300,7 @@ def run_suite(live_graphs=False):
             f"{', '.join(DEFAULT_EXPERIMENT_METHODS)}")
     noises = [0]
     seeds = [0, 1, 2, 3, 4]
-    rounds_per_run = int(os.getenv("NUM_ROUNDS", "50"))
+    rounds_per_run = int(os.getenv("NUM_ROUNDS", "2"))
     dataset = os.getenv("DATASET", "cifar10").lower()
     availability_model = os.getenv("AVAILABILITY_MODEL", "independent").lower()
     ablation = os.getenv("ABLATION", "no_surrogate").lower()

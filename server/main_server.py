@@ -22,7 +22,8 @@ from availability import extract_availability_vectors
 import numpy as np
 import json
 from collections import defaultdict
-from baselines import ALL_BASELINES, BaselineClient, BaselineState, select_clients
+from baselines import (ALL_BASELINES, RUNNABLE_BASELINES, UNIMPLEMENTED_BASELINES,
+                       BaselineClient, BaselineState, select_clients)
 from fairness import FairnessSchedulerController, fairness_metrics
 from experiment_config import build_logical_label_map
 
@@ -86,9 +87,47 @@ app = Flask(__name__)
 current_round = 0
 
 # Global device registry
-device_registry = {}
+registry_path = Path(os.getenv(
+    "REGISTERED_CLIENTS_CACHE",
+    os.getenv("DEVICE_REGISTRY_PATH", "registered_clients.json"),
+))
+registry_lock = threading.Lock()
+
+
+def reuse_registered_clients_enabled():
+    return os.getenv("REUSE_REGISTERED_CLIENTS", "1").lower() in (
+        "1", "true", "yes", "on")
+
+
+def load_device_registry():
+    """Restore physical endpoints shared by consecutive seed processes."""
+    if not reuse_registered_clients_enabled() or not registry_path.exists():
+        return {}
+    try:
+        data = json.loads(registry_path.read_text(encoding="utf-8"))
+        restored = {}
+        for device_id, endpoint in data.items():
+            restored[str(device_id)] = dict(endpoint)
+            restored[str(device_id)]["ip"] = str(endpoint["ip"])
+            restored[str(device_id)]["port"] = int(endpoint["port"])
+        return restored
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"⚠️ Ignoring invalid device registry {registry_path}: {error}")
+        return {}
+
+
+device_registry = load_device_registry()
+
+
+def persist_device_registry():
+    """Atomically persist endpoints and latest telemetry for the next run."""
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = registry_path.with_suffix(registry_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(device_registry), encoding="utf-8")
+    temporary.replace(registry_path)
 #topology = None  # ← define globally so update_status() can access it
 #current_round = 0  # make current_round global to
+
 
 # -------------------------------
 # 1. REGISTRATION ENDPOINT
@@ -100,10 +139,14 @@ def register():
     # 🧠 Use actual sender IP, not what the client claims
 #    sender_ip = request.remote_addr
 
-    device_registry[data["device_id"]] = {
-        "ip": data["ip"],
-        "port": data["port"]
-    }
+
+    with registry_lock:
+        # Refresh the endpoint without erasing telemetry saved by the previous
+        # seed process.
+        device_registry.setdefault(data["device_id"], {}).update({
+            "ip": data["ip"], "port": int(data["port"])})
+        persist_device_registry()
+
 
     print(f"📥 Registered {data['device_id']} at {data['ip']}:{data['port']}")
 
@@ -122,31 +165,20 @@ def ready():
     return "not_ready", 503
 
 def initialize_topology(device_file="devices.txt", num_clients=None):
-    num_clients = (int(os.getenv("PHYSICAL_CLIENT_COUNT", "3"))
-                   if num_clients is None else num_clients)
-    print("⏳ Waiting for clients to register...")
+    if num_clients is None:
+        num_clients = int(os.getenv(
+            "REGISTERED_CLIENT_COUNT",
+            os.getenv("PHYSICAL_CLIENT_COUNT",
+                      os.getenv("PHYSICAL_CONTAINER_LIMIT", "2")),
+        ))
+    print(
+        f"⏳ Waiting for clients to register... restored "
+        f"{len(device_registry)} endpoint(s) from {registry_path}")
     while len(device_registry) < num_clients:
         print(f"🕒 Registered devices: {len(device_registry)} / {num_clients}")
         time.sleep(2)
 
     print("✅ All clients registered. Initializing topology.")
-
-#    print("📄 Loading devices from file...")
-
-#    device_registry = {}
-#    with open(device_file, "r") as f:
-#        for i, line in enumerate(f):
-#            if i >= num_clients:
-#                break
-#            if not line.strip():
-#                continue
-#            device_id, ip, port = line.strip().split()
-#            device_registry[device_id] = {
-#                "ip": ip,
-#                "port": int(port)
-#            }
-
-#    print(f"✅ Loaded {len(device_registry)} devices.")
 
     device_ids = list(device_registry.keys())
 
@@ -160,13 +192,14 @@ def initialize_topology(device_file="devices.txt", num_clients=None):
     )
     shared_state.topology.dht = DHT(size=100)  # Initialize the DHT
     for device_id in device_ids:
+        cached = device_registry[device_id]
         shared_state.topology.dht.table[device_id] = {
-          "latency": None,
-          "packet_loss": None,
-          "last_seen": None,
-          "availability": None,
-          "freshness": None,
-          "correlation": None
+          "latency": cached.get("latency"),
+          "packet_loss": cached.get("packet_loss"),
+          "last_seen": cached.get("last_seen"),
+          "availability": cached.get("availability"),
+          "freshness": cached.get("freshness"),
+          "correlation": cached.get("correlation"),
         }
     print("✅ Topology initialized.")
     wait_for_latency_data(num_clients)
@@ -192,6 +225,16 @@ def update_status():
     shared_state.topology.dht.table[node]["availability"] = data["availability"]
     shared_state.topology.dht.table[node]["freshness"] = shared_state.topology.get_freshness(node, current_round)
     shared_state.topology.dht.table[node]["correlation"] = shared_state.topology.failure_correlation.get(node, {})
+    with registry_lock:
+        device_registry.setdefault(node, {}).update({
+            key: shared_state.topology.dht.table[node].get(key)
+            for key in ("latency", "packet_loss", "last_seen", "availability",
+                        "freshness", "correlation")
+        })
+        # defaultdict/set correlation state is not JSON serializable and is
+        # recomputed by each coordinator; persist only scalar telemetry.
+        device_registry[node]["correlation"] = None
+        persist_device_registry()
     print(f"📶 Updated status for {node}: latency={data['latency']}, loss={data['packet_loss']}")
 
 
@@ -261,6 +304,12 @@ def run_federated_training():
     selector = os.getenv("SELECTOR_MODE", "select_fair_nodes").lower()
     if selector != "select_fair_nodes" and selector not in ALL_BASELINES:
         raise ValueError(f"Unknown SELECTOR_MODE={selector!r}")
+
+    if selector in UNIMPLEMENTED_BASELINES:
+        raise NotImplementedError(
+            f"SELECTOR_MODE={selector!r} is not an end-to-end implementation: "
+            f"{UNIMPLEMENTED_BASELINES[selector]}. Runnable baselines: "
+            f"{', '.join(RUNNABLE_BASELINES)}")
 
     model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     model.fc = torch.nn.Linear(model.fc.in_features, 10)
@@ -365,6 +414,14 @@ def run_federated_training():
 
             else:
                 accuracy = None
+
+                print(
+                    "ERROR: No client model updates were received; metrics for "
+                    "this round are unavailable. Check client /train logs and "
+                    "CLIENT_TRAIN_TIMEOUT_SECONDS instead of interpreting zeros "
+                    "as measured accuracy or utility.",
+                    flush=True,
+                )
             for client_id in selected:
                 selection_counts[client_id] += 1
                 if accuracy is not None:

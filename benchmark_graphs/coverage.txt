@@ -1,0 +1,10 @@
+Graph renderer: Matplotlib
+Graph format version: 4 (title, labeled axes, ticks, values, per-method legend)
+
+Each method is an independent result series with its own color.
+
+Methods present in benchmark_results.csv:
+  cpp
+
+Methods without result rows (not plotted):
+  fedavg_random, uniform_available, fedprox, q_ffl, php_fl, fairfedcs, fedfv, afl, round_robin, least_selected, deficit_based, inverse_availability, oracle_availability, estimated_availability
