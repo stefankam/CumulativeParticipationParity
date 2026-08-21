@@ -43,6 +43,7 @@ COPY baselines.py .
 COPY fairness.py .
 COPY experiment_config.py .
 COPY data/ data/
+COPY worker_pool.py .
 
 # --------------------------
 # 5. Set environment

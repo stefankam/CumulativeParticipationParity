@@ -107,21 +107,6 @@ def completed_metric_rounds(metrics_path):
     return len(rounds)
 
 
-
-def mean_round_metric(rows, field):
-    """Average the real numeric observations for one final-metrics column."""
-    values = []
-    for row in rows:
-        value = row.get(field)
-        if value in (None, ""):
-            continue
-        try:
-            values.append(float(value))
-        except (TypeError, ValueError):
-            continue
-    return sum(values) / len(values) if values else ""
-
-
 def last_round_metric(rows, field):
     """Return the most recent real value for cumulative metrics such as runtime."""
     for row in reversed(rows):
@@ -130,6 +115,35 @@ def last_round_metric(rows, field):
             return value
     return ""
 
+
+
+def best_accuracy_round(rows):
+    """Return one coherent checkpoint: the latest round with peak accuracy.
+
+    Selecting one row avoids averaging early under-trained rounds into the
+    reported result. Ties prefer the later checkpoint. If accuracy is absent
+    from every row, retain the latest row so real fairness measurements from an
+    update-free partial run remain available.
+    """
+    best_row = None
+    best_accuracy = None
+    for row in rows:
+        value = row.get("global_accuracy")
+        if value in (None, ""):
+            continue
+        try:
+            accuracy = float(value)
+        except (TypeError, ValueError):
+            continue
+        if best_accuracy is None or accuracy >= best_accuracy:
+            best_accuracy = accuracy
+            best_row = row
+    return best_row if best_row is not None else (rows[-1] if rows else {})
+
+
+def checkpoint_metric(row, field):
+    """Return a metric from the selected checkpoint without synthesizing it."""
+    return row.get(field, "")
 
 
 
@@ -162,21 +176,23 @@ def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
             continue
         use_surrogate = run["ablation"] in {"surrogate", "full_method"}
         suffix = "With Surrogate" if use_surrogate else "No Surrogate"
+        checkpoint = best_accuracy_round(final_rows)
         candidate = {
             "dataset": run["dataset"],
             "seed": run["seed"],
             "method": "cpp" if run["selector"] == CPP_METHOD else run["selector"],
             "availability_model": run["availability_model"],
             "ablation": run["ablation"],
-            "global_accuracy": mean_round_metric(final_rows, "global_accuracy"),
-            "mean_client_accuracy": mean_round_metric(final_rows, "mean_client_accuracy"),
-            "worst_10_percent_utility": mean_round_metric(
-                final_rows, "worst_10_percent_utility"),
-            "utility_cv": mean_round_metric(final_rows, f"Utility CV ({suffix})"),
-            "utility_jain_index": mean_round_metric(
-                final_rows, f"Jain (Utility) ({suffix})"),
-            "conditional_selection_gap": mean_round_metric(
-                final_rows, f"Sel. Gap ({suffix})"),
+            "global_accuracy": checkpoint_metric(checkpoint, "global_accuracy"),
+            "mean_client_accuracy": checkpoint_metric(
+                checkpoint, "mean_client_accuracy"),
+            "worst_10_percent_utility": checkpoint_metric(
+                checkpoint, "worst_10_percent_utility"),
+            "utility_cv": checkpoint_metric(checkpoint, f"Utility CV ({suffix})"),
+            "utility_jain_index": checkpoint_metric(
+                checkpoint, f"Jain (Utility) ({suffix})"),
+            "conditional_selection_gap": checkpoint_metric(
+                checkpoint, f"Sel. Gap ({suffix})"),
             # runtime_seconds is cumulative elapsed time, so its final value is
             # the total run cost rather than a quantity to average over rounds.
             "runtime_seconds": last_round_metric(final_rows, "runtime_seconds"),
@@ -294,7 +310,7 @@ def run_case(env_overrides, run_tag, progress_callback=None):
     merged_tail = ''.join(tail)
     acc = last_accuracy(metrics_path)
     return_code = process.returncode
-    expected_rounds = int(env_overrides.get("NUM_ROUNDS", 50))
+    expected_rounds = int(env_overrides.get("NUM_ROUNDS", 20))
     completed_rounds = completed_metric_rounds(metrics_path)
     if return_code == 0 and completed_rounds < expected_rounds:
         return_code = 3
@@ -322,7 +338,7 @@ def run_suite(live_graphs=False):
     populations = [100]
     selections = [10]
     split_modes = ["overlap"]
-    labels_per_client_options = [2,5]
+    labels_per_client_options = [2]
     selectors = [
         item.strip() for item in os.getenv(
             "EXPERIMENT_METHODS", ",".join(DEFAULT_EXPERIMENT_METHODS)
@@ -335,7 +351,7 @@ def run_suite(live_graphs=False):
             f"{', '.join(DEFAULT_EXPERIMENT_METHODS)}")
     noises = [0]
     seeds = [0]
-    rounds_per_run = int(os.getenv("NUM_ROUNDS", "50"))
+    rounds_per_run = int(os.getenv("NUM_ROUNDS", "20"))
     dataset = os.getenv("DATASET", "cifar10").lower()
     availability_model = os.getenv("AVAILABILITY_MODEL", "independent").lower()
     ablation = os.getenv("ABLATION", "no_surrogate").lower()

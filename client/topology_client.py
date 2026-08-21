@@ -64,7 +64,11 @@ class TopologyProvider:
         self.utility_log = defaultdict(float)  # Tracks cumulative utility u_k(T)
         self.previous_losses = {}  # Stores last loss per client
         self.transform = self.get_transform()
-        self.logical_loaders = {} 
+        self.logical_loaders = {}
+        # Load CIFAR-10 once per physical process. Every logical shard below is
+        # a lightweight Subset view over this shared parent dataset.
+        self.full_train_dataset = datasets.CIFAR10(
+            root='data/', train=True, download=True, transform=self.transform)
         self.cifar_loader = self.load_cifar_data()
         self.dht = DHT(size=100)  # Initialize the DHT
         self.availability_predictor = AvailabilityPredictor(node_count=len(device_names) * num_workers)
@@ -202,19 +206,20 @@ class TopologyProvider:
             transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2430, 0.2610])
         ]) 
     
-    def load_cifar_data(self, subset_size=None):
-        """Load the CIFAR-10 dataset."""
-        full_dataset = datasets.CIFAR10(root='data/', train=True, download=True, transform=self.transform)
 
+
+    def load_cifar_data(self, subset_size=None):
+        """Build the physical worker's initial view over the shared dataset."""
         worker_name = self.device_names[0]
 
-        indices = self.get_subset_indices(worker_name, full_dataset, subset_size)
+        indices = self.get_subset_indices(
+            worker_name, self.full_train_dataset, subset_size)
         print(f"client is: {worker_name}")
-        indices = np.array(indices)
-        full_dataset.data = full_dataset.data[indices]
-        full_dataset.targets = [full_dataset.targets[i] for i in indices]
-        train_loader = DataLoader(full_dataset, batch_size=32, shuffle=False)
+        train_loader = DataLoader(
+            torch.utils.data.Subset(self.full_train_dataset, list(indices)),
+            batch_size=32, shuffle=False)
         return train_loader
+
 
 
     def _logical_loader(self, logical_id, labels_per_client):
@@ -222,26 +227,24 @@ class TopologyProvider:
         key = (logical_id, labels_per_client)
         if key in self.logical_loaders:
             return self.logical_loaders[key]
-        dataset = datasets.CIFAR10(
-            root='data/', train=True, download=False, transform=self.transform)
         logical_index = int(''.join(filter(str.isdigit, logical_id)) or 0)
         label_count = labels_per_client or 2
         wanted = {(logical_index + offset) % 10 for offset in range(label_count)}
-        indices = [index for index, label in enumerate(dataset.targets)
+        indices = [index for index, label in enumerate(self.full_train_dataset.targets)
                    if label in wanted]
 
-        # A physical worker executes several logical clients per round.  A
-        # 1,000-example shard with ResNet-18 regularly exceeds the server's
-        # 600-second HTTP deadline on CPU (the reported ~2,412 seconds is four
-        # waves timing out at that deadline).  Keep the default simulation
-        # workload bounded; larger paper workloads remain opt-in via the env.
-        limit = int(os.getenv("LOGICAL_CLIENT_SUBSET_SIZE", "100"))
-        if limit <= 0:
-            raise ValueError("LOGICAL_CLIENT_SUBSET_SIZE must be positive")
+        # By default use every CIFAR-10 example belonging to this logical
+        # client's assigned labels (roughly 10,000 examples for two labels).
+        # The parent 50,000-image array is still stored only once per process.
+        # A positive override remains available for smaller smoke tests.
+        limit = int(os.getenv("LOGICAL_CLIENT_SUBSET_SIZE", "1000"))
+        if limit < 0:
+            raise ValueError("LOGICAL_CLIENT_SUBSET_SIZE cannot be negative")
         rng = random.Random(logical_index)
         rng.shuffle(indices)
+        selected_indices = indices if limit == 0 else indices[:limit]
         loader = DataLoader(
-            torch.utils.data.Subset(dataset, indices[:limit]),
+            torch.utils.data.Subset(self.full_train_dataset, selected_indices),
             batch_size=32, shuffle=False)
         self.logical_loaders[key] = loader
         return loader
@@ -251,9 +254,11 @@ class TopologyProvider:
                            method="fedavg_random", fedprox_mu=0.01):
         """Train one logical client from the supplied global model."""
         if global_weights is not None:
-           # A physical worker may execute many logical clients and successive
-           # experiment seeds. Never leak the previous request's model or Adam
-           # moments into the next logical client.
+           # This is not training from a random initialization: global_weights
+           # already contain all prior aggregated rounds. Standard FedAvg loads
+           # that current global checkpoint before performing another local
+           # epoch, so stale per-worker weights cannot overwrite newer global
+           # learning when logical clients move between physical containers.
            self.model.load_state_dict(global_weights)
            self.optimizer = optim.Adam(
                filter(lambda parameter: parameter.requires_grad,
@@ -263,8 +268,11 @@ class TopologyProvider:
 
         train_loader = (self._logical_loader(logical_id, labels_per_client)
                         if logical_id is not None else self.cifar_loader)
-        reference = {name: value.detach().clone()
-                     for name, value in global_weights.items()}
+        reference = (
+            {name: value.detach().clone()
+             for name, value in global_weights.items()}
+            if method == "fedprox" else None
+        )
         # Training loop
         for epoch in range(local_epochs): 
             self.model.train()

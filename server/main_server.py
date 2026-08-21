@@ -85,6 +85,8 @@ def summarize_system(start, end):
 
 app = Flask(__name__)
 current_round = 0
+server_started_at = time.time()
+
 
 # Global device registry
 registry_path = Path(os.getenv(
@@ -139,23 +141,47 @@ def register():
     # 🧠 Use actual sender IP, not what the client claims
 #    sender_ip = request.remote_addr
 
-
-    # Once topology exists, cached registrations have already been consumed.
-    # Treat repeated requests from older clients as idempotent heartbeats rather
-    # than rebuilding or mutating the physical registry during training.
-    if shared_state.topology is not None and data["device_id"] in device_registry:
-        return "ALREADY_REGISTERED", 200
-
     with registry_lock:
+        device_id = data["device_id"]
+        endpoint = {"ip": str(data["ip"]), "port": int(data["port"])}
+
+        # The logical scheduler refers to stable physical slots (Device_0,
+        # Device_1, ...). A restarted replacement must therefore register with
+        # the failed worker's device_id. Reject a brand-new slot after topology
+        # initialization because it would not exist in the DHT used by status
+        # updates and selection.
+        if shared_state.topology is not None and device_id not in device_registry:
+            return (
+                "UNKNOWN_DEVICE_ID: restart the replacement with the failed "
+                "worker's --device_id",
+                409,
+            )
+
+        previous = dict(device_registry.get(device_id, {}))
+        endpoint_changed = any(
+            previous.get(key) != value for key, value in endpoint.items())
+
         # Refresh the endpoint without erasing telemetry saved by the previous
-        # seed process.
-        device_registry.setdefault(data["device_id"], {}).update({
-            "ip": data["ip"], "port": int(data["port"])})
+        # seed process. This is also the live failover path: send_weights reads
+        # this shared registry for every request, so later logical-client waves
+        # immediately use the replacement container's address.
+        device_registry.setdefault(device_id, {}).update(endpoint)
         persist_device_registry()
 
     print(f"📥 Registered {data['device_id']} at {data['ip']}:{data['port']}")
+    if endpoint_changed and previous:
+        print(
+            f"🔄 Rebound physical client {device_id} from "
+            f"{previous.get('ip')}:{previous.get('port')} to "
+            f"{endpoint['ip']}:{endpoint['port']}"
+        )
+        return "REBOUND", 200
+    if previous:
+        return "ALREADY_REGISTERED", 200
 
+    print(f"📥 Registered {device_id} at {endpoint['ip']}:{endpoint['port']}")
     return "OK", 200
+
 
 # Distributed Hash Table
 class DHT:
@@ -176,14 +202,48 @@ def initialize_topology(device_file="devices.txt", num_clients=None):
             os.getenv("PHYSICAL_CLIENT_COUNT",
                       os.getenv("PHYSICAL_CONTAINER_LIMIT", "2")),
         ))
-    print(
-        f"⏳ Waiting for clients to register... restored "
-        f"{len(device_registry)} endpoint(s) from {registry_path}")
-    while len(device_registry) < num_clients:
-        print(f"🕒 Registered devices: {len(device_registry)} / {num_clients}")
-        time.sleep(2)
+    restored_count = len(device_registry)
+    if restored_count >= num_clients:
+        print(
+            f"📂 Restored {restored_count} endpoint(s) from {registry_path}; "
+            "no re-registration wait is required."
+        )
+    else:
+        print(
+            f"⏳ Restored {restored_count} endpoint(s) from {registry_path}; "
+            "waiting only for the missing registrations."
+        )
+        while len(device_registry) < num_clients:
+            print(f"🕒 Registered devices: {len(device_registry)} / {num_clients}")
+            time.sleep(2)
 
-    print("✅ All clients registered. Initializing topology.")
+    # REGISTERED_CLIENT_COUNT is a minimum, not a hard cap. Once that minimum
+    # is present, keep registration open for a short quiet period so concurrently
+    # starting standby containers join the topology before /ready becomes true.
+    settle_seconds = float(os.getenv("PHYSICAL_REGISTRATION_SETTLE_SECONDS", "10"))
+    if settle_seconds > 0:
+        observed_count = len(device_registry)
+        settle_deadline = time.monotonic() + settle_seconds
+        print(
+            f"⏳ Minimum registration count reached; waiting {settle_seconds:g}s "
+            "for additional standby clients."
+        )
+        while time.monotonic() < settle_deadline:
+            current_count = len(device_registry)
+            if current_count != observed_count:
+                observed_count = current_count
+                settle_deadline = time.monotonic() + settle_seconds
+                print(
+                    f"📥 Registration pool now has {observed_count} clients; "
+                    "resetting standby settle timer."
+                )
+            time.sleep(0.25)
+
+    registered_count = len(device_registry)
+    print(
+        f"✅ Registration pool closed with {registered_count} clients. "
+        "Initializing topology."
+    )
 
     device_ids = list(device_registry.keys())
 
@@ -207,7 +267,10 @@ def initialize_topology(device_file="devices.txt", num_clients=None):
           "correlation": cached.get("correlation"),
         }
     print("✅ Topology initialized.")
-    wait_for_latency_data(num_clients)
+    # The registry may contain endpoints left by containers that died during a
+    # previous benchmark. Require only enough fresh workers to fill the active
+    # pool, then collect every additional fresh reporter as a standby.
+    wait_for_latency_data(int(os.getenv("PHYSICAL_CONTAINER_LIMIT", "3")))
 
 
 @app.route("/status_update", methods=["POST"])
@@ -356,7 +419,7 @@ def run_federated_training():
         final_writer = csv.DictWriter(final_output, fieldnames=final_fields)
         final_writer.writeheader()
         for current_round in range(int(os.getenv("NUM_ROUNDS", 50))):
-            physical_ids = list(device_registry)[:physical_limit]
+            physical_ids = shared_state.topology.active_physical_worker_snapshot()
             if use_logical:
                 clients = []
                 for client_id in client_ids:
@@ -476,21 +539,57 @@ def run_federated_training():
 
 
 
+def fresh_latency_nodes():
+    """Return workers that have reported telemetry to this coordinator process."""
+    return [
+        node for node, metadata in shared_state.topology.dht.table.items()
+        if (metadata.get("latency") is not None
+            and metadata.get("packet_loss") is not None
+            and metadata.get("last_seen") is not None
+            and metadata["last_seen"] >= server_started_at)
+    ]
+
+
 def wait_for_latency_data(num_clients=3):
     print("⏳ Waiting for latency updates from clients...")
+    telemetry_settle_seconds = float(os.getenv(
+        "PHYSICAL_TELEMETRY_SETTLE_SECONDS",
+        os.getenv("PHYSICAL_REGISTRATION_SETTLE_SECONDS", "10"),
+    ))
     while True:
-        ready = 0
-        for node, metadata in shared_state.topology.dht.table.items():
-            if metadata.get("latency") is not None and metadata.get("packet_loss") is not None:
-                ready += 1
-        print(f"✅ Clients with latency info: {ready} / {num_clients}")
-        if ready >= num_clients:
+        ready_nodes = fresh_latency_nodes()
+        print(f"✅ Clients with fresh latency info: {len(ready_nodes)} / {num_clients}")
+        if len(ready_nodes) >= num_clients:
             break
         time.sleep(2)
 
-    print("🚀 Sufficient clients reported latency. Starting training.")
-    run_federated_training()
+    # Do not use len(device_registry) here: the shared registry intentionally
+    # survives across benchmark children and can contain dead endpoints. Wait
+    # for a quiet period and build the pool solely from current-process reporters.
+    if telemetry_settle_seconds > 0:
+        observed_ready = len(ready_nodes)
+        settle_deadline = time.monotonic() + telemetry_settle_seconds
+        print(
+            f"⏳ Active capacity reached; collecting fresh standbys for "
+            f"{telemetry_settle_seconds:g}s."
+        )
+        while time.monotonic() < settle_deadline:
+            current_ready = fresh_latency_nodes()
+            if len(current_ready) != observed_ready:
+                ready_nodes = current_ready
+                observed_ready = len(current_ready)
+                settle_deadline = time.monotonic() + telemetry_settle_seconds
+                print(
+                    f"📡 Fresh physical pool now has {observed_ready} workers; "
+                    "resetting telemetry settle timer."
+                )
+            time.sleep(0.25)
 
+    physical_limit = int(os.getenv("PHYSICAL_CONTAINER_LIMIT", "3"))
+    shared_state.topology.configure_physical_worker_pool(
+        ready_nodes, physical_limit)
+    print("🚀 Fresh physical pool ready. Starting training.")
+    run_federated_training()
 
 
 

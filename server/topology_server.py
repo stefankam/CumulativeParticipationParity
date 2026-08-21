@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 from torch.utils.data import ConcatDataset
 from fairness import FairnessSchedulerController
-
+from worker_pool import PhysicalWorkerPool, PhysicalWorkerPoolExhausted
 
 
 
@@ -66,6 +66,7 @@ class TopologyProvider:
         self.surrogate_contributions = defaultdict(int)
         self.surrogate_staleness = defaultdict(int)
         self.device_registry = device_registry or {}
+        self.physical_worker_pool = PhysicalWorkerPool()
         self.failure_correlation = defaultdict(lambda: defaultdict(set))
         self.recovery_counters = {}   # how many healthy rounds since failure
         self.probation_rounds = {}    # when node first recovered
@@ -297,35 +298,68 @@ class TopologyProvider:
         return pod_dns
 
 
-    def run_logical_federated_round(self, logical_ids, physical_ids, global_weights, per_client_timeout=30):
+    def configure_physical_worker_pool(self, physical_ids, active_count):
+        """Split healthy registered workers into stable active and standby pools."""
+        self.physical_worker_pool.configure(physical_ids, active_count)
+        print(
+            f"🛡️ Physical worker pool: "
+            f"active={self.physical_worker_pool.active_snapshot()}, "
+            f"standby={self.physical_worker_pool.standby}"
+        )
+
+
+
+    def active_physical_worker_snapshot(self):
+        return self.physical_worker_pool.active_snapshot()
+
+    def quarantine_and_promote(self, failed_worker):
+        """Atomically replace a failed active worker with the next standby."""
+        replacement = self.physical_worker_pool.quarantine_and_promote(failed_worker)
+        print(
+            f"🔄 Quarantined failed physical worker {failed_worker}; "
+            f"promoted standby {replacement}."
+        )
+        return replacement
+
+    def run_logical_federated_round(
+            self, logical_ids, physical_ids, global_weights,
+            per_client_timeout=30, active_count=None):
         updated_weights = []
-        if not physical_ids:
-            return None
+        if not self.active_physical_worker_snapshot():
+            self.configure_physical_worker_pool(
+                physical_ids,
+                len(physical_ids) if active_count is None else active_count,
+            )
 
         def train_logical_on_physical(logical_id, physical_id):
-            print(f"Sending logical client {logical_id} to physical {physical_id}")
-            # Hard bound each logical-client request so one slow client cannot stall the round.
-            client_weights = self.send_weights_to_client(
-                physical_id,
-                global_weights,
-                max_retries=1,
-                sync_only=False,
-                logical_id=logical_id,
-                logical_labels_per_client=self.logical_labels_per_client,
-            )
-            if client_weights is not None:
-                client_weights["client_id"] = logical_id
-                return client_weights
-            print(f"⚠️ Logical client {logical_id} via {physical_id} timed out/skipped.")
-            return None
+            while True:
+                print(f"Sending logical client {logical_id} to physical {physical_id}")
+                client_weights = self.send_weights_to_client(
+                    physical_id,
+                    global_weights,
+                    max_retries=1,
+                    sync_only=False,
+                    logical_id=logical_id,
+                    logical_labels_per_client=self.logical_labels_per_client,
+                )
+                if client_weights is not None:
+                    client_weights["client_id"] = logical_id
+                    return client_weights
+                print(
+                    f"⚠️ Logical client {logical_id} failed via {physical_id}; "
+                    "promoting a standby and retrying."
+                )
+                physical_id = self.quarantine_and_promote(physical_id)
 
-        wave_size = len(physical_ids)
+        active_workers = self.active_physical_worker_snapshot()
+        wave_size = len(active_workers)
         for wave_start in range(0, len(logical_ids), wave_size):
             wave = logical_ids[wave_start:wave_start + wave_size]
+            active_workers = self.active_physical_worker_snapshot()
             with ThreadPoolExecutor(max_workers=wave_size) as executor:
                 futures = []
                 for idx, logical_id in enumerate(wave):
-                    physical_id = physical_ids[idx % wave_size]
+                    physical_id = active_workers[idx % wave_size]
                     futures.append(executor.submit(train_logical_on_physical, logical_id, physical_id))
 
                 for future in as_completed(futures):
@@ -335,7 +369,7 @@ class TopologyProvider:
 
         return self.aggregate_weights(updated_weights, global_weights)
 
-	
+
 
     def run_federated_round(self, selected_hosts, global_weights, model=None):
         # Backward compatibility for the former call shape
