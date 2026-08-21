@@ -215,6 +215,7 @@ def periodic_status_update(interval=10, max_updates=5):
         send_status_update()
         time.sleep(interval)
 
+
 def wait_for_topology_ready(delay=2):
     while True:
         try:
@@ -233,11 +234,13 @@ if __name__ == "__main__":
     #print("📟 Starting client {device_id_str} (device index {})".format(device_index))
     #print(f"📟 Client {device_id_str} is listening on port {port}")
 
+
     # Register once on initial startup. Consecutive seed coordinators restore
-    # this endpoint from REGISTERED_CLIENTS_CACHE and do not need repeated POSTs.
+    # this endpoint from REGISTERED_CLIENTS_CACHE.
     while not register_with_main_server():
         time.sleep(2)
     wait_for_topology_ready()
+
 
     # Keep telemetry current without repeatedly calling /register.
     threading.Thread(target=periodic_status_update, daemon=True).start()

@@ -107,6 +107,35 @@ def completed_metric_rounds(metrics_path):
     return len(rounds)
 
 
+
+def mean_round_metric(rows, field):
+    """Average the real numeric observations for one final-metrics column."""
+    values = []
+    for row in rows:
+        value = row.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return sum(values) / len(values) if values else ""
+
+
+def last_round_metric(rows, field):
+    """Return the most recent real value for cumulative metrics such as runtime."""
+    for row in reversed(rows):
+        value = row.get(field)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+
+
+
+
+
 def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
                             include_in_progress=False):
     """Convert successful suite final-metric files into graph-ready rows.
@@ -131,7 +160,6 @@ def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
             final_rows = list(csv.DictReader(handle))
         if not final_rows:
             continue
-        final = final_rows[-1]
         use_surrogate = run["ablation"] in {"surrogate", "full_method"}
         suffix = "With Surrogate" if use_surrogate else "No Surrogate"
         candidate = {
@@ -140,13 +168,18 @@ def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
             "method": "cpp" if run["selector"] == CPP_METHOD else run["selector"],
             "availability_model": run["availability_model"],
             "ablation": run["ablation"],
-            "global_accuracy": final.get("global_accuracy"),
-            "mean_client_accuracy": final.get("mean_client_accuracy"),
-            "worst_10_percent_utility": final.get("worst_10_percent_utility"),
-            "utility_cv": final.get(f"Utility CV ({suffix})"),
-            "utility_jain_index": final.get(f"Jain (Utility) ({suffix})"),
-            "conditional_selection_gap": final.get(f"Sel. Gap ({suffix})"),
-            "runtime_seconds": final.get("runtime_seconds"),
+            "global_accuracy": mean_round_metric(final_rows, "global_accuracy"),
+            "mean_client_accuracy": mean_round_metric(final_rows, "mean_client_accuracy"),
+            "worst_10_percent_utility": mean_round_metric(
+                final_rows, "worst_10_percent_utility"),
+            "utility_cv": mean_round_metric(final_rows, f"Utility CV ({suffix})"),
+            "utility_jain_index": mean_round_metric(
+                final_rows, f"Jain (Utility) ({suffix})"),
+            "conditional_selection_gap": mean_round_metric(
+                final_rows, f"Sel. Gap ({suffix})"),
+            # runtime_seconds is cumulative elapsed time, so its final value is
+            # the total run cost rather than a quantity to average over rounds.
+            "runtime_seconds": last_round_metric(final_rows, "runtime_seconds"),
         }
         # Preserve partial real measurements.  A round with no client update
         # legitimately has a blank global accuracy, but its utility/fairness
@@ -163,6 +196,8 @@ def write_benchmark_results(rows, destination=BENCHMARK_RESULTS,
         writer.writeheader()
         writer.writerows(benchmark_rows)
     return benchmark_rows
+
+
 
 
 def write_experiment_results(rows, fieldnames, destination=OUT):
@@ -287,7 +322,7 @@ def run_suite(live_graphs=False):
     populations = [100]
     selections = [10]
     split_modes = ["overlap"]
-    labels_per_client_options = [2]
+    labels_per_client_options = [2,5]
     selectors = [
         item.strip() for item in os.getenv(
             "EXPERIMENT_METHODS", ",".join(DEFAULT_EXPERIMENT_METHODS)
@@ -299,8 +334,8 @@ def run_suite(live_graphs=False):
             f"Unknown EXPERIMENT_METHODS entries: {sorted(unknown)}; choose from "
             f"{', '.join(DEFAULT_EXPERIMENT_METHODS)}")
     noises = [0]
-    seeds = [0, 1, 2, 3, 4]
-    rounds_per_run = int(os.getenv("NUM_ROUNDS", "2"))
+    seeds = [0]
+    rounds_per_run = int(os.getenv("NUM_ROUNDS", "50"))
     dataset = os.getenv("DATASET", "cifar10").lower()
     availability_model = os.getenv("AVAILABILITY_MODEL", "independent").lower()
     ablation = os.getenv("ABLATION", "no_surrogate").lower()

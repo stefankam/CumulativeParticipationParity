@@ -140,13 +140,18 @@ def register():
 #    sender_ip = request.remote_addr
 
 
+    # Once topology exists, cached registrations have already been consumed.
+    # Treat repeated requests from older clients as idempotent heartbeats rather
+    # than rebuilding or mutating the physical registry during training.
+    if shared_state.topology is not None and data["device_id"] in device_registry:
+        return "ALREADY_REGISTERED", 200
+
     with registry_lock:
         # Refresh the endpoint without erasing telemetry saved by the previous
         # seed process.
         device_registry.setdefault(data["device_id"], {}).update({
             "ip": data["ip"], "port": int(data["port"])})
         persist_device_registry()
-
 
     print(f"📥 Registered {data['device_id']} at {data['ip']}:{data['port']}")
 
