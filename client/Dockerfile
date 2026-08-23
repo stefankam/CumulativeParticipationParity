@@ -31,6 +31,7 @@ WORKDIR /app
 COPY main_client.py .
 COPY topology_client.py .
 COPY availability.py .
+COPY php_fl.py .
 COPY data/ data/
 COPY traces/ traces/
 

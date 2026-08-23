@@ -23,6 +23,7 @@ from torchvision import datasets
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 from flask import Flask, request
+from php_fl import train_php_fl
 
 
 class CustomHost:
@@ -65,6 +66,7 @@ class TopologyProvider:
         self.previous_losses = {}  # Stores last loss per client
         self.transform = self.get_transform()
         self.logical_loaders = {}
+        self.php_states = {}
         # Load CIFAR-10 once per physical process. Every logical shard below is
         # a lightweight Subset view over this shared parent dataset.
         self.full_train_dataset = datasets.CIFAR10(
@@ -89,13 +91,47 @@ class TopologyProvider:
         self.model.fc = torch.nn.Linear(self.model.fc.in_features, 10)  # CIFAR-10
         self.dnn_model = self.model
         self.criterion = torch.nn.CrossEntropyLoss()
-#        self.optimizer = optim.Adam(self.model.fc.parameters(), lr=0.001)
-        for name, param in self.model.named_parameters():
-            param.requires_grad = name.startswith("layer4") or name.startswith("fc")
-        self.optimizer = optim.Adam(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=0.001,
+        self._configure_trainable_parameters()
+        self.optimizer = self._new_optimizer()
+
+    def _configure_trainable_parameters(self):
+        """Freeze the shared feature extractor unless explicitly requested.
+
+        Updating a complete ResNet block with Adam on a two-class shard makes
+        successive non-IID clients overwrite one another.  A classifier-only
+        default preserves the pretrained global representation; experiments
+        can opt into the last one or more blocks with
+        ``LOCAL_TRAINABLE_BLOCKS``.
+        """
+        trainable_blocks = int(os.getenv("LOCAL_TRAINABLE_BLOCKS", "0"))
+        if not 0 <= trainable_blocks <= 4:
+            raise ValueError("LOCAL_TRAINABLE_BLOCKS must be between 0 and 4")
+        block_names = [f"layer{index}" for index in range(5 - trainable_blocks, 5)]
+        self.trainable_block_names = tuple(block_names)
+        for name, parameter in self.model.named_parameters():
+            parameter.requires_grad = (
+                name.startswith("fc")
+                or any(name.startswith(block) for block in block_names)
+            )
+
+    def _new_optimizer(self):
+        """Return a fresh FedAvg local optimizer for the current global state."""
+        return optim.SGD(
+            (parameter for parameter in self.model.parameters()
+             if parameter.requires_grad),
+            lr=float(os.getenv("CLIENT_LEARNING_RATE", "0.01")),
+            momentum=float(os.getenv("CLIENT_MOMENTUM", "0.0")),
         )
+
+    def _set_local_training_mode(self):
+        """Train selected layers without changing frozen BatchNorm buffers."""
+        self.model.eval()
+        self.model.fc.train()
+        for block_name in self.trainable_block_names:
+            getattr(self.model, block_name).train()
+
+
+
 
     def get_subset_indices(self, worker_name, dataset, subset_size=None,  seed=42):
         """
@@ -233,11 +269,10 @@ class TopologyProvider:
         indices = [index for index, label in enumerate(self.full_train_dataset.targets)
                    if label in wanted]
 
-        # By default use every CIFAR-10 example belonging to this logical
-        # client's assigned labels (roughly 10,000 examples for two labels).
-        # The parent 50,000-image array is still stored only once per process.
-        # A positive override remains available for smaller smoke tests.
-        limit = int(os.getenv("LOGICAL_CLIENT_SUBSET_SIZE", "1000"))
+
+        # Keep the default request small enough for CPU workers. Setting the
+        # limit to zero opts into every matching CIFAR-10 example.
+        limit = int(os.getenv("LOGICAL_CLIENT_SUBSET_SIZE", "100"))
         if limit < 0:
             raise ValueError("LOGICAL_CLIENT_SUBSET_SIZE cannot be negative")
         rng = random.Random(logical_index)
@@ -260,14 +295,43 @@ class TopologyProvider:
            # epoch, so stale per-worker weights cannot overwrite newer global
            # learning when logical clients move between physical containers.
            self.model.load_state_dict(global_weights)
-           self.optimizer = optim.Adam(
-               filter(lambda parameter: parameter.requires_grad,
-                      self.model.parameters()),
-               lr=0.001,
-           )
+           # Optimizer state belongs to a single logical client update. Reusing
+           # Adam moments across clients biases a physical worker toward the
+           # clients it happened to execute previously.
+           self.optimizer = self._new_optimizer()
+
 
         train_loader = (self._logical_loader(logical_id, labels_per_client)
                         if logical_id is not None else self.cifar_loader)
+
+
+        # q-FedAvg and AFL require F_k(w_t), not the final epoch/minibatch loss.
+        self.model.eval()
+        global_loss_sum = 0.0
+        global_examples = 0
+        with torch.no_grad():
+            for inputs, labels in train_loader:
+                outputs = self.model(inputs)
+                global_loss_sum += F.cross_entropy(
+                    outputs, labels, reduction="sum").item()
+                global_examples += labels.size(0)
+        loss_at_global = global_loss_sum / max(1, global_examples)
+        if method == "php_fl":
+            auxiliary_state, php_diagnostics = train_php_fl(
+                self.model, train_loader, self.php_states, logical_id,
+                local_epochs)
+            print(f"PHP-FL state for {logical_id}: {php_diagnostics}")
+            return {
+                "record_type": "php_fl_auxiliary",
+                "client_id": logical_id,
+                "state_dict": auxiliary_state,
+                "loss": php_diagnostics["supervised"],
+                "loss_at_global": loss_at_global,
+                "sample_count": len(train_loader.dataset),
+                "php_diagnostics": php_diagnostics,
+            }
+
+
         reference = (
             {name: value.detach().clone()
              for name, value in global_weights.items()}
@@ -275,7 +339,7 @@ class TopologyProvider:
         )
         # Training loop
         for epoch in range(local_epochs): 
-            self.model.train()
+            self._set_local_training_mode()
             running_loss = 0.0
             correct_predictions = 0
             total_predictions = 0
@@ -316,6 +380,7 @@ class TopologyProvider:
         return {
             "state_dict": self.model.state_dict(),
             "loss": avg_loss,
+            "loss_at_global": loss_at_global,
             "sample_count": len(train_loader.dataset),
         }
 

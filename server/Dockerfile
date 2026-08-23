@@ -44,6 +44,8 @@ COPY fairness.py .
 COPY experiment_config.py .
 COPY data/ data/
 COPY worker_pool.py .
+COPY fl_methods.py .
+COPY cup.py .
 
 # --------------------------
 # 5. Set environment

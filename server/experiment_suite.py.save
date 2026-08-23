@@ -93,6 +93,24 @@ def last_accuracy(metrics_path):
     return None
 
 
+def last_awpsp_accuracy(metrics_path):
+    """Compatibility reader for legacy AW-PSP metric logs."""
+    metrics_path = Path(metrics_path)
+    if not metrics_path.exists():
+        return None
+    with metrics_path.open() as handle:
+        rows = list(csv.DictReader(handle))
+    for row in reversed(rows):
+        value = row.get("AWPSP_Accuracy")
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+
 def completed_metric_rounds(metrics_path):
     """Count distinct round rows actually persisted by the child process."""
     metrics_path = Path(metrics_path)
@@ -107,6 +125,7 @@ def completed_metric_rounds(metrics_path):
     return len(rounds)
 
 
+
 def last_round_metric(rows, field):
     """Return the most recent real value for cumulative metrics such as runtime."""
     for row in reversed(rows):
@@ -114,7 +133,6 @@ def last_round_metric(rows, field):
         if value not in (None, ""):
             return value
     return ""
-
 
 
 def best_accuracy_round(rows):
@@ -141,11 +159,10 @@ def best_accuracy_round(rows):
     return best_row if best_row is not None else (rows[-1] if rows else {})
 
 
+
 def checkpoint_metric(row, field):
     """Return a metric from the selected checkpoint without synthesizing it."""
     return row.get(field, "")
-
-
 
 
 
@@ -310,7 +327,7 @@ def run_case(env_overrides, run_tag, progress_callback=None):
     merged_tail = ''.join(tail)
     acc = last_accuracy(metrics_path)
     return_code = process.returncode
-    expected_rounds = int(env_overrides.get("NUM_ROUNDS", 20))
+    expected_rounds = int(env_overrides.get("NUM_ROUNDS", 50))
     completed_rounds = completed_metric_rounds(metrics_path)
     if return_code == 0 and completed_rounds < expected_rounds:
         return_code = 3
@@ -338,7 +355,7 @@ def run_suite(live_graphs=False):
     populations = [100]
     selections = [10]
     split_modes = ["overlap"]
-    labels_per_client_options = [2]
+    labels_per_client_options = [2,5]
     selectors = [
         item.strip() for item in os.getenv(
             "EXPERIMENT_METHODS", ",".join(DEFAULT_EXPERIMENT_METHODS)

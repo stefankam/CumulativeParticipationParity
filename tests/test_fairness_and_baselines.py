@@ -1,4 +1,5 @@
 import random
+import pytest
 import sys
 from pathlib import Path
 
@@ -49,14 +50,23 @@ def test_cup_rates_satisfy_expected_budget():
 
 def test_every_baseline_is_runnable_and_availability_safe():
     for method in ALL_BASELINES:
+        if method in {"fairfedcs", "fedavg_random"}:
+            continue
         selected = select_clients(method, clients(), 1, BaselineState(), rng=random.Random(4))
         assert "offline" not in selected
 
 
-def test_qffl_upweights_high_loss_clients():
-    weights = aggregation_weights("q_ffl", ["a", "b"], losses={"a": 1.0, "b": 3.0})
-    assert weights["b"] > weights["a"]
-    assert sum(weights.values()) == 1.0
+def test_fedavg_random_records_scheduler_intent_before_availability_gate():
+    selected = select_clients(
+        "fedavg_random", [BaselineClient("offline", 0.0)], 1,
+        BaselineState(), rng=random.Random(4))
+    assert selected == ["offline"]
+
+
+def test_stateful_methods_cannot_use_scalar_aggregation_weights():
+    for method in ("q_ffl", "afl", "php_fl"):
+        with pytest.raises(ValueError, match="dedicated stateful server update"):
+            aggregation_weights(method, ["a", "b"])
 
 
 def test_utility_only_accrues_on_participation():

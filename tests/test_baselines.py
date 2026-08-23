@@ -17,15 +17,14 @@ def test_runnable_registry_does_not_claim_unwired_optimizers():
     assert {"fedprox", "q_ffl", "php_fl", "fairfedcs", "fedfv", "afl"} <= set(RUNNABLE_BASELINES)
 
 
-def test_fairfedcs_and_php_prioritize_participation_debt():
+def test_php_uses_shared_availability_and_fairfedcs_requires_stateful_selector():
     clients = [BaselineClient("often", selections=5),
                BaselineClient("rare", selections=0)]
-    for method in ("fairfedcs", "php_fl"):
-        state = BaselineState()
-        state.selections["often"] = 5
-        assert select_clients(method, clients, 1, state,
-                              rng=random.Random(0)) == ["rare"]
-
+    assert select_clients("php_fl", clients, 1, BaselineState(),
+                          rng=random.Random(0))[0] in {"often", "rare"}
+    with pytest.raises(RuntimeError, match="persistent FairFedCSState"):
+        select_clients("fairfedcs", clients, 1, BaselineState(),
+                       rng=random.Random(0))
 
 def test_fedavg_uses_sample_counts():
     result = fedavg({"w": 0.0}, [{"w": 2.0}, {"w": 6.0}], [1, 3])

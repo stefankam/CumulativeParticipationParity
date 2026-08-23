@@ -177,8 +177,13 @@ class FairnessSchedulerController:
     def select(self, *, telemetry, capacity, mu_hat, budget=None):
         pi_hat = self.estimator.estimates(self.clients)
         if self.mode == "cup":
-            return self.scheduler.select(self.clients, capacity, availability=telemetry, pi_hat=pi_hat, mu_hat=mu_hat,
-                                         budget=min(capacity,sum(pi_hat.values())) if budget is None else budget)
+            # A trace can legitimately begin with every client offline. Keep
+            # CUP's strictly-positive rate equations defined until each client
+            # has observed its first online opportunity.
+            smoothed = {client: max(value, 1e-12)
+                        for client, value in pi_hat.items()}
+            return self.scheduler.select(self.clients, capacity, availability=telemetry, pi_hat=smoothed, mu_hat=mu_hat,
+                                         budget=min(capacity,sum(smoothed.values())) if budget is None else budget)
         if self.mode == "reactive": return self.scheduler.select(self.clients, capacity, availability=telemetry, pi_hat=pi_hat)
         return self.scheduler.select(self.clients, capacity, pi_hat)
     def end_round(self, participated):

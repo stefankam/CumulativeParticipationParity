@@ -1,3 +1,4 @@
+
 # topology_server.py
 
 import sys
@@ -33,7 +34,9 @@ import torchvision.transforms as transforms
 from torch.utils.data import ConcatDataset
 from fairness import FairnessSchedulerController
 from worker_pool import PhysicalWorkerPool, PhysicalWorkerPoolExhausted
-
+from fl_methods import (AFLState, fedavg, normalize_records,
+                        cup_importance_corrected_update,
+                        php_fl_auxiliary_update, q_fedavg)
 
 
 class TopologyProvider:
@@ -84,7 +87,21 @@ class TopologyProvider:
         # Read-only compatibility alias; scheduling implementation lives in fairness.py.
         self.availability_estimator = self.fairness_scheduler.estimator
         self.surrogate_mode = os.getenv("SURROGATE_MODE", "accounting").lower()
+        self.logical_client_ids = ()
+        self.afl_state = None
+        self.last_method_diagnostics = {}
+        self.last_client_records = []
+        self.cup_round_context = {}
 
+    def configure_logical_clients(self, client_ids):
+        """Install full-population state required by stateful server methods."""
+        client_ids = tuple(client_ids)
+        if client_ids != self.logical_client_ids:
+            self.logical_client_ids = client_ids
+            self.afl_state = AFLState(client_ids)
+
+    def set_cup_round_context(self, context):
+        self.cup_round_context = dict(context)
 
 
     def get_subset_indices(self, worker_name, dataset, subset_size=1000, seed=42):
@@ -402,51 +419,44 @@ class TopologyProvider:
     def aggregate_weights(self, weight_list, global_weights=None):
         if not weight_list:
            print("⚠️ No weights to aggregate (no clients participated this round).")
-           return None  # or return last global weights, or reinitialize
-        # Logical rounds retain an optional aggregation weight alongside each
-        # state dict.  The previous implementation treated that tuple as a state
-        # dict and crashed while indexing it with an OrderedDict key.
+           self.last_client_records = []
+           if os.getenv("SELECTOR_MODE", "").lower() == "select_fair_nodes":
+               return copy.deepcopy(global_weights)
+           return None
         method = os.getenv("SELECTOR_MODE", "fedavg_random").lower()
-        records = []
-        for update in weight_list:
-            if "state_dict" in update:
-                records.append(update)
-            elif (isinstance(update, tuple) and len(update) == 2):
-                records.append({"state_dict": update[0], "sample_count": update[1], "loss": 1.0})
-            else:
-                records.append({"state_dict": update, "sample_count": 1, "loss": 1.0})
-        raw = []
-        for record in records:
-            samples, loss = float(record.get("sample_count", 1)), max(float(record.get("loss", 1)), 1e-12)
-            if method == "q_ffl": raw.append(samples * loss ** float(os.getenv("Q_FFL_Q", "1")))
-            elif method in {"php_fl", "fairfedcs"}: raw.append(samples / (1 + self.utility_log[record.get("client_id", "")]))
-            elif method == "afl": raw.append(math.exp(float(os.getenv("AFL_ETA", ".1")) * loss))
-            else: raw.append(samples)
-        total_weight = sum(raw)
-        if total_weight <= 0:
-            return None
-        weighted = [(record["state_dict"], weight / total_weight)
-                    for record, weight in zip(records, raw)]
-        if method == "q_ffl" and global_weights is not None:
-            q = float(os.getenv("Q_FFL_Q", "1"))
-            learning_rate = float(os.getenv("CLIENT_LEARNING_RATE", ".001"))
-            deltas, hs = [], []
-            for record in records:
-                loss = max(float(record.get("loss", 1)), 1e-12)
-                delta = {key: global_weights[key] - record["state_dict"][key]
-                         for key in global_weights
-                         if torch.is_floating_point(global_weights[key])}
-                squared_norm = sum((value * value).sum().item() for value in delta.values())
-                loss_q = loss ** q
-                deltas.append((delta, loss_q))
-                hs.append(q * loss ** (q - 1) * squared_norm + loss_q / learning_rate)
-            denominator = sum(hs)
-            result = copy.deepcopy(global_weights)
-            for key in result:
-                if torch.is_floating_point(result[key]):
-                    result[key] = global_weights[key] - sum(
-                        delta[key] * loss_q for delta, loss_q in deltas) / denominator
+        records = normalize_records(weight_list)
+        self.last_client_records = records
+        if method == "select_fair_nodes":
+            return cup_importance_corrected_update(
+                global_weights, records, self.cup_round_context,
+                len(self.logical_client_ids),
+                eps=float(os.getenv("CUP_AGGREGATION_EPS", "1e-12")),
+                correction_clip=float(os.getenv("CUP_AGGREGATION_CLIP", "100")),
+            )
+        if method == "q_ffl":
+            if global_weights is None:
+                raise ValueError("q-FFL requires the current global model")
+            result, self.last_method_diagnostics = q_fedavg(global_weights, records)
+            print(f"q-FFL state: {self.last_method_diagnostics}")
             return result
+        if method == "afl":
+            if global_weights is None or self.afl_state is None:
+                raise ValueError("AFL requires configured logical clients and global weights")
+            result, self.last_method_diagnostics = self.afl_state.update(global_weights, records)
+            print(f"AFL state: {self.last_method_diagnostics}")
+            return result
+        if method == "php_fl":
+            result, self.last_method_diagnostics = php_fl_auxiliary_update(records)
+            print(f"PHP-FL auxiliary state: {self.last_method_diagnostics}")
+            return result
+        # FairFedCS changes selection, then uses standard FedAvg.
+        weighted_result = fedavg(records)
+        if method != "fedfv":
+            return weighted_result
+        weighted = [(record["state_dict"], float(record.get("sample_count", 1)))
+                    for record in records]
+        total_weight = sum(weight for _, weight in weighted)
+        weighted = [(state, weight / total_weight) for state, weight in weighted]
         # FedFV projects conflicting client model deltas before averaging.
         if method == "fedfv" and global_weights is not None:
             deltas = [{key: state[key] - global_weights[key] for key in state
@@ -530,6 +540,27 @@ class TopologyProvider:
                 per_client_acc[node] = (100 * correct / total) if total else None
 
         return per_client_acc
+
+    def evaluate_logical_client_accuracy(self, model, label_map):
+        """Evaluate every logical client with one shared CIFAR-10 test pass."""
+        model.eval()
+        dataset = datasets.CIFAR10(
+            root='data/', train=False, download=False, transform=self.transform)
+        loader = DataLoader(dataset, batch_size=32, shuffle=False)
+        correct = defaultdict(int); totals = defaultdict(int)
+        with torch.no_grad():
+            for images, labels in loader:
+                predictions = model(images).argmax(dim=1)
+                for label in range(10):
+                    mask = labels == label
+                    totals[label] += int(mask.sum())
+                    correct[label] += int((predictions[mask] == labels[mask]).sum())
+        return {
+            client_id: (100.0 * sum(correct[label] for label in client_labels)
+                        / max(1, sum(totals[label] for label in client_labels)))
+            for client_id, client_labels in label_map.items()
+        }
+
 
     def get_freshness(self, node, current_round):
         """Returns how long since this node was last selected."""
@@ -645,47 +676,11 @@ class TopologyProvider:
 
     def select_fair_nodes(self, model, current_round, correlated_failures, label_map, num_clients,
                               corr_threshold=0.35, lambda_=0.5, epsilon=1e-5):
-        """Select clients through the standalone CPP fairness policy.
-        The topology layer supplies live availability and participation state; all
-        ranking decisions live in :mod:`fairness` so experiments and tests use the
-        exact same implementation.
-        """
-
-        del corr_threshold, lambda_, epsilon_  # retained for API compatibility
-        correlated = {node for pair in correlated_failures for node in pair}
-        telemetry = {}
-        for node, metadata in self.dht.table.items():
-            is_available = node not in self.failed_nodes and node not in correlated
-            observed = float(metadata.get("availability") or 0.0) if is_available else 0.0
-            estimated = self.availability_counts[node] / max(1, self.total_rounds_elapsed)
-            if estimated <= 0:
-                estimated = observed or 1.0
-            telemetry[node] = observed > 0
-        clients = list(self.dht.table)
-        if not hasattr(self, "fairness_controller") or self.fairness_controller.clients != clients:
-            self.fairness_controller = FairnessSchedulerController(clients, mode="cup")
-        self.fairness_controller.observe_telemetry(telemetry)
-        selected = self.fairness_controller.select(
-            telemetry=telemetry,
-            capacity=num_clients,
-            mu_hat={node: max(self.utility_log.get(node, 0.0), 1e-12) for node in clients},
+        raise RuntimeError(
+            "Legacy availability-filtered CUP selection is disabled; use "
+            "CumulativeUtilityParity in the logical round coordinator so A, S, "
+            "and P remain distinct."
         )
-        self.total_rounds_elapsed += 1
-        for node, available in telemetry.items():
-            if available:
-                self.availability_counts[node] += 1
-        self.update_participation_log(selected, current_round)
-
-        counts = [len(self.participation_log.get(node, [])) for node in self.dht.table]
-        mean = sum(counts) / len(counts) if counts else 0.0
-        variance = sum((value - mean) ** 2 for value in counts) / len(counts) if counts else 0.0
-        # Surrogate bias accounting belongs to model evaluation, not selection.
-        return selected, variance, 0.0
-
-
-
-
-
 
 
 

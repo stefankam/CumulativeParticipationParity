@@ -32,7 +32,7 @@ SCHEDULING_METHODS = (
     "round_robin", "least_selected", "deficit_based", "inverse_availability",
     "oracle_availability", "estimated_availability",
 )
-METHODS = STANDARD_METHODS + FAIR_FL_METHODS + SCHEDULING_METHODS + ("cpp",)
+METHODS = STANDARD_METHODS + FAIR_FL_METHODS + SCHEDULING_METHODS + ("CUP",)
 # PHP-FL and FairFedCS require their authors' external implementations.  They
 # remain in the published matrix but are never silently replaced by another
 # algorithm in native benchmark runs.

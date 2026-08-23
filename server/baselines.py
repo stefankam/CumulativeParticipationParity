@@ -55,7 +55,9 @@ def select_clients(
     if name not in ALL_BASELINES:
         raise ValueError(f"unknown baseline {name!r}; choose from {', '.join(ALL_BASELINES)}")
     available = [client for client in clients if client.availability > 0]
-    count = min(max(count, 0), len(available))
+    count = min(max(count, 0),
+                len(clients) if name == "fedavg_random" else len(available))
+
     if not count:
         return []
 
@@ -65,7 +67,6 @@ def select_clients(
         chosen = rng.sample(available, count)
     elif name == "fedavg_random":
         chosen = rng.sample(list(clients), min(count, len(clients)))
-        chosen = [client for client in chosen if client.availability > 0]
     elif name == "round_robin":
         ordered = sorted(available, key=lambda client: client.client_id)
         chosen = [ordered[(state.cursor + i) % len(ordered)] for i in range(count)]
@@ -75,12 +76,12 @@ def select_clients(
     elif name == "deficit_based":
         rounds = max(1, sum(state.selections.values()) // max(1, count) + 1)
         chosen = sorted(available, key=lambda c: (state.selections[c.client_id] - rounds, c.client_id))[:count]
-    elif name in {"fairfedcs", "php_fl"}:
-        # Both fairness-aware methods prioritize participation debt; PHP-FL's
-        # historical performance weighting is applied during aggregation.
-        chosen = sorted(available, key=lambda client: (
-            state.selections[client.client_id],
-            -client.estimated_availability, client.client_id))[:count]
+    elif name == "php_fl":
+        # PHP-FL's defining DEAL/ISPU operations are client/server model
+        # updates, not a participation-debt selector.
+        chosen = rng.sample(available, count)
+    elif name == "fairfedcs":
+        raise RuntimeError("FairFedCS requires its persistent FairFedCSState selector")
     elif name == "deficit_based":
         rounds = max(1, sum(state.selections.values()) // max(1, count) + 1)
         chosen = sorted(available, key=lambda c: (state.selections[c.client_id] - rounds, c.client_id))[:count]
@@ -107,7 +108,7 @@ def aggregation_weights(
     losses: Mapping[str, float] | None = None,
     q: float = 1.0,
 ) -> dict[str, float]:
-    """Return normalized server aggregation weights for a baseline.
+    """Return ordinary aggregation weights only.
 
     FedProx's proximal local objective must be applied by the client; its server
     aggregation remains sample-weighted FedAvg. FedFV additionally requires its
@@ -115,17 +116,15 @@ def aggregation_weights(
     """
     if not client_ids:
         return {}
+    if name in {"q_ffl", "afl", "php_fl"}:
+        raise ValueError(f"{name} requires its dedicated stateful server update")
     sample_counts = sample_counts or {}
     losses = losses or {}
     raw: dict[str, float] = {}
     for client_id in client_ids:
         samples = max(1, sample_counts.get(client_id, 1))
         loss = max(1e-12, losses.get(client_id, 1.0))
-        if name == "q_ffl":
-            raw[client_id] = samples * loss ** q
-        elif name in ("php_fl", "fairfedcs", "afl"):
-            raw[client_id] = samples * loss
-        elif name == "fedfv":
+        if name == "fedfv":
             raw[client_id] = 1.0
         else:
             raw[client_id] = float(samples)

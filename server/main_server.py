@@ -18,15 +18,19 @@ import requests
 import socket
 from topology_server import TopologyProvider
 import shared_state
-from availability import extract_availability_vectors
+from availability import (extract_availability_vectors,
+                          logical_client_availability,
+                          resolve_availability_trace_path)
+
 import numpy as np
 import json
 from collections import defaultdict
 from baselines import (ALL_BASELINES, RUNNABLE_BASELINES, UNIMPLEMENTED_BASELINES,
                        BaselineClient, BaselineState, select_clients)
-from fairness import FairnessSchedulerController, fairness_metrics
+from fairness import fairness_metrics
 from experiment_config import build_logical_label_map
-
+from fl_methods import FairFedCSState
+from cup import CumulativeUtilityParity
 
 
 def read_proc_stat() -> Tuple[int, int]:
@@ -378,6 +382,11 @@ def run_federated_training():
             f"SELECTOR_MODE={selector!r} is not an end-to-end implementation: "
             f"{UNIMPLEMENTED_BASELINES[selector]}. Runnable baselines: "
             f"{', '.join(RUNNABLE_BASELINES)}")
+    if not use_logical:
+        raise NotImplementedError(
+            "Audited CUP and common retrospective baseline accounting require "
+            "USE_LOGICAL_SCHEDULING=true; the legacy physical path does not "
+            "provide a complete per-round A/S/P vector for the logical population.")
 
     model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     model.fc = torch.nn.Linear(model.fc.in_features, 10)
@@ -386,14 +395,32 @@ def run_federated_training():
         logical_count, labels_per_client, split_mode=split_mode,
         dirichlet_alpha=float(os.getenv("DIRICHLET_ALPHA", 0.5)), seed=seed,
     )
+    trace_path = resolve_availability_trace_path(
+        os.getenv("AVAILABILITY_TRACE_PATH", "traces/traces.txt"))
+    availability_vectors = extract_availability_vectors(
+        trace_path,
+        length=max(100, int(os.getenv("NUM_ROUNDS", 50))),
+    )
+
+
+    trace_path = resolve_availability_trace_path(
+        os.getenv("AVAILABILITY_TRACE_PATH", "traces/traces.txt"))
+    availability_vectors = extract_availability_vectors(
+        trace_path,
+        length=max(100, int(os.getenv("NUM_ROUNDS", 50))),
+    )
+
 
     client_ids = [f"h{i}" for i in range(logical_count)]
+    shared_state.topology.configure_logical_clients(client_ids)
     selection_counts = defaultdict(int)
+    participation_counts = defaultdict(int)
     availability_seen = defaultdict(int)
-    utility_sums = defaultdict(float)
-    utility_observations = defaultdict(int)
     baseline_state = BaselineState()
-    fairness_controller = FairnessSchedulerController(client_ids, mode="cup", seed=seed)
+    cup = CumulativeUtilityParity(
+        client_ids, selected_per_round, seed=seed,
+        output_path=os.getenv("CUP_ROUND_LOG_PATH", "cup_rounds.csv"))
+    fairfedcs_state = FairFedCSState(tuple(client_ids), selected_per_round)
     metrics_path = os.getenv("METRICS_LOG_PATH", "metrics_log.csv")
     Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -402,6 +429,8 @@ def run_federated_training():
     Path(final_metrics_path).parent.mkdir(parents=True, exist_ok=True)
     final_fields = [
         "Round", "global_accuracy", "mean_client_accuracy",
+        "Jain (Client Accuracy)",
+        "utility_metric", "cup_scheduler",
         "worst_10_percent_utility", "Utility CV (No Surrogate)",
         "Jain (Utility) (No Surrogate)", "Sel. Gap (No Surrogate)",
         "Utility CV (With Surrogate)", "Jain (Utility) (With Surrogate)",
@@ -413,7 +442,8 @@ def run_federated_training():
             final_metrics_path, "w", newline="") as final_output:
         writer = csv.DictWriter(output, fieldnames=[
             "round", "method", "accuracy", "participation_gini",
-            "participation_variance", "selected_clients",
+            "participation_variance", "selected_clients", "utility_metric",
+            "cup_scheduler",
         ])
         writer.writeheader()
         final_writer = csv.DictWriter(final_output, fieldnames=final_fields)
@@ -423,31 +453,45 @@ def run_federated_training():
             if use_logical:
                 clients = []
                 for client_id in client_ids:
-                    # Logical clients are mapped onto currently live physical workers.
-                    available = 1.0 if physical_ids else 0.0
+                    # Logical availability comes from the per-device trace. A
+                    # healthy physical pool is execution capacity, not evidence
+                    # that every simulated logical client is online.
+                    trace_available = logical_client_availability(
+                        availability_vectors, client_id, current_round)
+                    available = float(bool(physical_ids) and trace_available)
                     availability_seen[client_id] += int(available > 0)
                     estimate = availability_seen[client_id] / (current_round + 1)
                     clients.append(BaselineClient(
                         client_id, available, estimate,
                         selection_counts[client_id], tuple(logical_labels.get(client_id, ())),
                     ))
+                telemetry = {client.client_id: bool(client.availability) for client in clients}
                 if selector == "select_fair_nodes":
-                    telemetry = {client.client_id: bool(client.availability) for client in clients}
-                    fairness_controller.observe_telemetry(telemetry)
-                    selected = fairness_controller.select(
-                        telemetry=telemetry,
-                        capacity=selected_per_round,
+                    selected = cup.select_clients(
+                        telemetry, current_round,
                         mu_hat={
-                            client_id: utility_sums[client_id] / utility_observations[client_id]
-                            if utility_observations[client_id] else 1.0
-                            for client_id in client_ids
-                        },
+                            client_id: max(
+                                cup.states[client_id].utility
+                                / max(1, cup.states[client_id].participation_count),
+                                float(os.getenv("CUP_EPSILON", "1e-3")),
+                            ) for client_id in client_ids
+                        })
+                elif selector == "fairfedcs":
+                    selected = fairfedcs_state.select(
+                        [client.client_id for client in clients if client.availability],
+                        selected_per_round,
                     )
                 else:
                     selected = select_clients(selector, clients, selected_per_round, baseline_state, rng=rng)
-                updated = shared_state.topology.run_logical_federated_round(selected, physical_ids, weights)
+                if selector != "select_fair_nodes":
+                    cup.observe_external_selection(telemetry, current_round, selected)
+                participating = cup.realize_participation(telemetry, selected)
+                if selector == "select_fair_nodes":
+                    shared_state.topology.set_cup_round_context(
+                        cup.aggregation_context())
+                updated = shared_state.topology.run_logical_federated_round(
+                    participating, physical_ids, weights)
             else:
-
                 failures = shared_state.topology.get_correlated_failure(
                     current_round, extract_availability_vectors("traces/traces.txt"),
                     corr_threshold=0.35, num_neighbors=4,
@@ -478,10 +522,18 @@ def run_federated_training():
                 accuracy = shared_state.topology.evaluate_global_model(
                     model, selected_nodes=selected, use_selected_nodes=False,
                 )
-
+                per_client_accuracy = (
+                    shared_state.topology.evaluate_logical_client_accuracy(
+                        model, logical_labels)
+                    if use_logical else
+                    shared_state.topology.evaluate_per_client_accuracy(model, client_ids)
+                )
 
             else:
                 accuracy = None
+                per_client_accuracy = {
+                    client_id: (cup.states[client_id].previous_eval_accuracy or 0.0)
+                    for client_id in client_ids}
 
                 print(
                     "ERROR: No client model updates were received; metrics for "
@@ -492,45 +544,67 @@ def run_federated_training():
                 )
             for client_id in selected:
                 selection_counts[client_id] += 1
-                if accuracy is not None:
-                    utility_sums[client_id] += max(float(accuracy), 1e-12)
-                    utility_observations[client_id] += 1
-                    shared_state.topology.utility_log[client_id] += max(float(accuracy), 1e-12)
+            for client_id in participating:
+                participation_counts[client_id] += 1
+            cup.end_round(
+                current_round, telemetry, selected, per_client_accuracy,
+                shared_state.topology.last_client_records)
+            if selector == "fairfedcs":
+                fairfedcs_state.on_round_end(
+                    selected, shared_state.topology.last_client_records)
+                print(
+                    "FairFedCS state:",
+                    {client_id: {
+                        "reputation": fairfedcs_state.reputations[client_id],
+                        "queue": fairfedcs_state.queues[client_id],
+                        "csi": fairfedcs_state.suitability(client_id),
+                    } for client_id in client_ids},
+                )
             counts = [selection_counts[client_id] for client_id in client_ids]
             mean = sum(counts) / len(counts) if counts else 0.0
             variance = sum((value - mean) ** 2 for value in counts) / len(counts) if counts else 0.0
-            normalized = {client_id: float(selection_counts[client_id]) for client_id in client_ids}
-            round_fairness = fairness_metrics(normalized, selection_counts)
+            round_fairness = fairness_metrics(
+                {client_id: float(participation_counts[client_id]) for client_id in client_ids},
+                participation_counts)
             writer.writerow({
                 "round": current_round, "method": selector, "accuracy": accuracy,
                 "participation_gini": round_fairness["gini_coefficient"],
                 "participation_variance": variance, "selected_clients": selected,
+                "utility_metric": cup.utility_metric,
+                "cup_scheduler": cup.scheduler_mode,
             })
             output.flush()
 
 
             observed_utilities = [
-                utility_sums[client_id] / utility_observations[client_id]
-                if utility_observations[client_id] else 0.0
-                for client_id in client_ids
-            ]
+                cup.states[client_id].normalized_utility
+                if math.isfinite(cup.states[client_id].normalized_utility) else 0.0
+                for client_id in client_ids]
             utility_by_client = dict(zip(client_ids, observed_utilities))
             utility_fairness = fairness_metrics(utility_by_client, selection_counts)
+            cup_metrics = cup.metrics(current_round + 1)
+            cup_metrics_with_surrogate = cup.metrics(
+                current_round + 1, include_surrogate=True)
+            accuracy_fairness = fairness_metrics(
+                per_client_accuracy, selection_counts)
             tail_size = max(1, math.ceil(len(observed_utilities) * 0.1))
             final_writer.writerow({
                 "Round": current_round + 1,
                 "global_accuracy": accuracy,
                 "mean_client_accuracy": (
-                    sum(observed_utilities) / len(observed_utilities)
-                    if observed_utilities else 0.0),
+                    sum(per_client_accuracy.values()) / len(per_client_accuracy)
+                    if per_client_accuracy else 0.0),
+                "Jain (Client Accuracy)": accuracy_fairness["utility_jain_index"],
+                "utility_metric": cup.utility_metric,
+                "cup_scheduler": cup.scheduler_mode,
                 "worst_10_percent_utility": (
                     sum(sorted(observed_utilities)[:tail_size]) / tail_size),
-                "Utility CV (No Surrogate)": utility_fairness["utility_cv"],
-                "Jain (Utility) (No Surrogate)": utility_fairness["utility_jain_index"],
-                "Sel. Gap (No Surrogate)": utility_fairness["selection_gap"],
-                "Utility CV (With Surrogate)": utility_fairness["utility_cv"],
-                "Jain (Utility) (With Surrogate)": utility_fairness["utility_jain_index"],
-                "Sel. Gap (With Surrogate)": utility_fairness["selection_gap"],
+                "Utility CV (No Surrogate)": cup_metrics["utility_cv"],
+                "Jain (Utility) (No Surrogate)": cup_metrics["utility_jain_index"],
+                "Sel. Gap (No Surrogate)": cup_metrics["selection_gap"],
+                "Utility CV (With Surrogate)": cup_metrics_with_surrogate["utility_cv"],
+                "Jain (Utility) (With Surrogate)": cup_metrics_with_surrogate["utility_jain_index"],
+                "Sel. Gap (With Surrogate)": cup_metrics_with_surrogate["selection_gap"],
                 "runtime_seconds": time.perf_counter() - training_started,
             })
             final_output.flush()

@@ -1,5 +1,7 @@
-import re 
+import re
 import json
+from pathlib import Path
+
 
 class AvailabilityTrace:
     def __init__(self, trace_path, device_index):
@@ -78,9 +80,10 @@ def load_availability_traces(path):
 
     return traces
 
-def extract_availability_vectors(path):
+
+def extract_availability_vectors(path, length=100):
    traces = load_availability_traces(path)
-   def extract_vector(trace, length=100):
+   def extract_vector(trace):
       wifi, charging = False, False
       vector = []
       for event in trace:
@@ -99,3 +102,40 @@ def extract_availability_vectors(path):
 
    #print("availability_vectors: ", availability_vectors)
    return availability_vectors
+
+
+
+
+def resolve_availability_trace_path(path):
+   """Resolve a trace path from either the repository or server directory."""
+   requested = Path(path)
+   candidates = [requested]
+   if not requested.is_absolute():
+      candidates.append(Path(__file__).resolve().parent / requested)
+      candidates.append(Path(__file__).resolve().parent / requested.name)
+   for candidate in candidates:
+      if candidate.is_file():
+         return candidate
+   raise FileNotFoundError(
+      f"Availability trace not found at any of: "
+      f"{', '.join(str(candidate) for candidate in candidates)}"
+   )
+
+
+def logical_client_availability(vectors, client_id, round_index):
+   """Return logical ``h0`` availability from trace device ``h1``.
+
+   The trace loader retains the original one-based host names while logical
+   clients are zero-based. Vectors loop when an experiment exceeds their
+   configured length.
+   """
+   match = re.search(r'(\d+)$', str(client_id))
+   if match is None:
+      raise ValueError(f"Logical client ID has no numeric suffix: {client_id!r}")
+   trace_key = f"h{int(match.group(1)) + 1}"
+   if trace_key not in vectors:
+      raise KeyError(f"No availability trace for {client_id!r} ({trace_key})")
+   vector = vectors[trace_key]
+   if not vector:
+      return False
+   return bool(vector[int(round_index) % len(vector)])
