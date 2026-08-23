@@ -24,7 +24,7 @@ class CUPClientState:
     utility: float = 0.0
     normalized_utility: float = 0.0
     participation_debt: int = 0
-    previous_eval_accuracy: float | None = None
+    previous_participation_accuracy: float | None = None
     previous_loss: float | None = None
     last_real_participation_round: int | None = None
     last_real_utility_increment: float = 0.0
@@ -98,6 +98,9 @@ class CumulativeUtilityParity:
         self.capacity = min(int(capacity), len(self.client_ids))
         self.scheduler_mode = os.getenv("CUP_SCHEDULER", "reactive").lower()
         self.utility_metric = os.getenv("CUP_UTILITY_METRIC", "accuracy_gain").lower()
+        self.utility_max_increment = float(os.getenv("CUP_UTILITY_MAX_INCREMENT", "1.0"))
+        if self.utility_max_increment <= 0:
+            raise ValueError("CUP_UTILITY_MAX_INCREMENT must be positive")
         self.epsilon = float(os.getenv("CUP_EPSILON", "1e-3"))
         self.inverse_clip = float(os.getenv("CUP_INVERSE_AVAILABILITY_CLIP", "100"))
         self.cup_debt_coefficient = float(os.getenv("CUP_DEBT_LAMBDA", ".1"))
@@ -125,6 +128,7 @@ class CumulativeUtilityParity:
             "seed": seed,
             "availability_trace_identifier": os.getenv("AVAILABILITY_TRACE_PATH", "traces/traces.txt"),
             "utility_definition": self.utility_metric,
+            "utility_max_increment": self.utility_max_increment,
             "cup_scheduler_mode": self.scheduler_mode,
             "epsilon": self.epsilon,
             "inverse_availability_clip": self.inverse_clip,
@@ -199,13 +203,18 @@ class CumulativeUtilityParity:
 
     def _utility_increment(self, state, accuracy, loss_record):
         if self.utility_metric == "accuracy_gain":
-            increment = 0.0 if state.previous_eval_accuracy is None else accuracy - state.previous_eval_accuracy
-            state.previous_eval_accuracy = accuracy
-            return increment
+            previous = state.previous_participation_accuracy
+            state.previous_participation_accuracy = accuracy
+            gain = 0.0 if previous is None else accuracy - previous
+            return min(max(0.0, gain), self.utility_max_increment)
         if self.utility_metric == "loss_reduction":
             if loss_record is None:
                 return 0.0
-            return max(0.0, float(loss_record["loss_at_global"]) - float(loss_record["loss"]))
+            reduction = max(
+                0.0,
+                float(loss_record["loss_at_global"]) - float(loss_record["loss"]),
+            )
+            return min(reduction, self.utility_max_increment)
         raise ValueError("CUP_UTILITY_METRIC must be accuracy_gain or loss_reduction")
 
     def end_round(self, round_index, availability, selected, per_client_accuracy, records):
@@ -219,9 +228,13 @@ class CumulativeUtilityParity:
             participated_bit = int(client_id in participated_set)
             state.selection_count += selected_bit
             state.participation_count += participated_bit
-            increment = self._utility_increment(
-                state, float(per_client_accuracy[client_id]), records_by_client.get(client_id))
+            increment = 0.0
             if participated_bit:
+                increment = self._utility_increment(
+                    state,
+                    float(per_client_accuracy[client_id]),
+                    records_by_client.get(client_id),
+                )
                 state.utility += increment
                 state.last_real_utility_increment = increment
                 state.last_real_participation_round = round_index

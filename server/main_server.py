@@ -532,7 +532,9 @@ def run_federated_training():
             else:
                 accuracy = None
                 per_client_accuracy = {
-                    client_id: (cup.states[client_id].previous_eval_accuracy or 0.0)
+                    client_id: (
+                        cup.states[client_id].previous_participation_accuracy or 0.0
+                    )
                     for client_id in client_ids}
 
                 print(
